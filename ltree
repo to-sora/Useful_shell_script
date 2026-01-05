@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Env overrides:
+#   L=20 D=3 ./ltree ...
+LIMIT="${L:-20}"
+MAX_DEPTH="${D:--1}"    # -1 = unlimited
+SHOW_ALL=0              # -a to show dotfiles
+
+OUT=""
+SMART=0                 # -S smart promote (optional)
+PEEK_MAX=2000           # -P max omitted entries to peek (smart mode)
+META_GLOB=""            # -K 'meta*' or '*.nfo' (smart mode)
+
+usage() {
+  cat <<EOF
+Usage:
+  ltree [options] dir1 [dir2 ...]
+Options (can appear anywhere):
+  -L N   Max entries shown per directory level (default: $LIMIT)  (env: L)
+  -D N   Max recursion depth (0=no recursion; default: unlimited) (env: D)
+  -a     Show dotfiles
+  -o F   Write output to file F (2 sections: marked list, '===', then trees)
+  -S     Smart mode: in big dirs, also promote omitted subdirs that are small (<=L)
+  -P N   Smart peek max per big dir (default: $PEEK_MAX)
+  -K G   Promote dirs containing a metadata file matching glob G (e.g. -K 'meta*')
+  -h     Help
+
+Example:
+  ./ltree -D 10 -L 10 mmd_render HF_repo -o output.txt
+  D=10 L=10 ./ltree -S -K 'meta*' a b c -o output.txt
+EOF
+  exit 1
+}
+
+# ---- parse args (options anywhere) ----
+roots=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -L) LIMIT="${2:-}"; shift 2 ;;
+    -D) MAX_DEPTH="${2:-}"; shift 2 ;;
+    -a) SHOW_ALL=1; shift ;;
+    -o) OUT="${2:-}"; shift 2 ;;
+    -S) SMART=1; shift ;;
+    -P) PEEK_MAX="${2:-}"; shift 2 ;;
+    -K) META_GLOB="${2:-}"; shift 2 ;;
+    -h|--help) usage ;;
+    --) shift; roots+=("$@"); break ;;
+    -*) echo "Unknown option: $1" >&2; usage ;;
+    *)  roots+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#roots[@]} -ge 1 ]] || usage
+[[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "Invalid -L: $LIMIT" >&2; exit 2; }
+[[ "$MAX_DEPTH" =~ ^-?[0-9]+$ ]] || { echo "Invalid -D: $MAX_DEPTH" >&2; exit 2; }
+[[ "$PEEK_MAX" =~ ^[0-9]+$ ]] || { echo "Invalid -P: $PEEK_MAX" >&2; exit 2; }
+[[ -n "$OUT" ]] || { echo "Tip: use -o output.txt to write file without redirection." >&2; }
+
+# ---- helpers ----
+list_names_sorted() {
+  local d="$1"
+  if (( SHOW_ALL )); then
+    find "$d" -mindepth 1 -maxdepth 1 -printf '%f\0' 2>/dev/null | sort -z
+  else
+    find "$d" -mindepth 1 -maxdepth 1 ! -name '.*' -printf '%f\0' 2>/dev/null | sort -z
+  fi
+}
+
+count_children_limited() {
+  local d="$1"
+  local expr=()
+  if (( !SHOW_ALL )); then expr+=( ! -name '.*' ); fi
+  find "$d" -mindepth 1 -maxdepth 1 "${expr[@]}" -printf '.' 2>/dev/null \
+    | head -c $((LIMIT+1)) \
+    | wc -c | tr -d '[:space:]'
+}
+
+has_meta_file() {
+  local d="$1"
+  [[ -n "$META_GLOB" ]] || return 1
+  find "$d" -maxdepth 1 -type f -name "$META_GLOB" -print -quit 2>/dev/null | grep -q .
+}
+
+walk() {
+  local d="$1" p="$2" depth="$3"
+  local -a all=() disp=() sel=()
+  local total shown i name full excluded more last connector newprefix
+
+  mapfile -d '' -t all < <(list_names_sorted "$d" || true)
+  total=${#all[@]}
+  (( total == 0 )) && return
+
+  if (( total <= LIMIT )); then
+    disp=("${all[@]}")
+    excluded=0
+  else
+    disp=("${all[@]:0:LIMIT}")
+    excluded=$(( total - LIMIT ))
+
+    if (( SMART )); then
+      local start=$LIMIT end=$(( LIMIT + PEEK_MAX ))
+      (( end > total )) && end=$total
+
+      for ((i=start; i<end; i++)); do
+        name="${all[i]}"
+        full="$d/$name"
+        if [[ -d "$full" && ! -L "$full" ]]; then
+          if [[ -r "$full" && -x "$full" ]]; then
+            local cnt
+            cnt="$(count_children_limited "$full")"
+            if (( cnt <= LIMIT )); then
+              sel+=("$name")
+              continue
+            fi
+          fi
+          if has_meta_file "$full"; then
+            sel+=("$name")
+            continue
+          fi
+        fi
+      done
+
+      if (( ${#sel[@]} > 0 )); then
+        disp+=("${sel[@]}")
+        excluded=$(( total - ${#disp[@]} ))
+        (( excluded < 0 )) && excluded=0
+      fi
+    fi
+  fi
+
+  local disp_n=${#disp[@]}
+  for ((i=0; i<disp_n; i++)); do
+    name="${disp[i]}"
+    full="$d/$name"
+
+    more=$(( excluded > 0 ))
+    last=$(( i == disp_n - 1 ))
+
+    if (( last && !more )); then
+      connector="└── "
+      newprefix="${p}    "
+    else
+      connector="├── "
+      newprefix="${p}│   "
+    fi
+
+    if [[ -d "$full" && ! -L "$full" ]]; then
+      printf "%s%s%s/\n" "$p" "$connector" "$name"
+      if (( MAX_DEPTH < 0 || depth < MAX_DEPTH )); then
+        walk "$full" "$newprefix" $((depth+1))
+      fi
+    else
+      printf "%s%s%s\n" "$p" "$connector" "$name"
+    fi
+  done
+
+  if (( excluded > 0 )); then
+    printf "%s└── ... (%d more entries omitted)\n" "$p" "$excluded"
+  fi
+}
+
+print_tree_block() {
+  local root="$1"
+  root="${root%/}"
+  if [[ ! -d "$root" ]]; then
+    printf "%s/ [not a directory or not found]\n" "$root"
+    return
+  fi
+  printf "%s/\n" "$root"
+  walk "$root" "" 0
+}
+
+# ---- output assembly ----
+emit_new_file() {
+  local tmp="$1"
+  : > "$tmp"
+
+  # MARKED PART
+  for r in "${roots[@]}"; do
+    printf "%s\n" "${r%/}" >> "$tmp"
+  done
+  printf "===\n" >> "$tmp"
+
+  # DATA PART
+  local first=1
+  for r in "${roots[@]}"; do
+    if (( first == 0 )); then printf "---\n" >> "$tmp"; fi
+    print_tree_block "$r" >> "$tmp"
+    first=0
+  done
+}
+
+emit_update_file() {
+  local tmp="$1" out="$2"
+  local sep_line
+  sep_line="$(grep -n -m1 '^===\s*$' "$out" | cut -d: -f1 || true)"
+
+  # If no separator, just append a fresh block at end (keeps existing content)
+  if [[ -z "$sep_line" ]]; then
+    cp -f "$out" "$tmp"
+    printf "\n" >> "$tmp"
+    # new marked + data
+    for r in "${roots[@]}"; do printf "%s\n" "${r%/}" >> "$tmp"; done
+    printf "===\n" >> "$tmp"
+    local first=1
+    for r in "${roots[@]}"; do
+      if (( first == 0 )); then printf "---\n" >> "$tmp"; fi
+      print_tree_block "$r" >> "$tmp"
+      first=0
+    done
+    return
+  fi
+
+  # Copy header (before ===) as-is
+  head -n $((sep_line-1)) "$out" > "$tmp"
+
+  # Dedup header lines, then insert new roots before ===
+  declare -A seen=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    seen["$line"]=1
+  done < <(head -n $((sep_line-1)) "$out")
+
+  for r in "${roots[@]}"; do
+    r="${r%/}"
+    if [[ -z "${seen[$r]+x}" ]]; then
+      printf "%s\n" "$r" >> "$tmp"
+      seen["$r"]=1
+    fi
+  done
+
+  # Write separator
+  printf "===\n" >> "$tmp"
+
+  # Copy existing data (after ===) as-is
+  tail -n +"$((sep_line+1))" "$out" >> "$tmp"
+
+  # Append new trees at end
+  # Decide if there is existing data already (non-empty)
+  local has_data=0
+  if tail -n +"$((sep_line+1))" "$out" | grep -q '.'; then
+    has_data=1
+  fi
+
+  printf "\n" >> "$tmp"
+  local first=1
+  for r in "${roots[@]}"; do
+    if (( has_data == 1 || first == 0 )); then
+      printf "---\n" >> "$tmp"
+    fi
+    print_tree_block "$r" >> "$tmp"
+    first=0
+    has_data=1
+  done
+}
+
+if [[ -n "$OUT" ]]; then
+  tmp="$(mktemp)"
+  if [[ -f "$OUT" ]]; then
+    emit_update_file "$tmp" "$OUT"
+  else
+    emit_new_file "$tmp"
+  fi
+  mv -f "$tmp" "$OUT"
+else
+  # stdout mode (same format)
+  tmp="$(mktemp)"
+  emit_new_file "$tmp"
+  cat "$tmp"
+  rm -f "$tmp"
+fi
