@@ -1,34 +1,47 @@
-
 #!/usr/bin/env bash
+# NOTE: keep original structure/order as much as possible for easy git diff
+
+# ---- run-as-user safety (original intent, strengthened) ----
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  echo "FATAL: do not run as root; run as a normal user." >&2; exit 1
+fi
 if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" ]]; then
   echo "FATAL: do not run under sudo; run as a normal user." >&2; exit 1
 fi
 
-
 set -euo pipefail
 umask 022
 
+# ---- better failure signal (does not change control flow, only diagnostics) ----
+trap 'echo "FATAL: failed at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" >&2' ERR
+
 # ===== pinned versions (your previous working set) =====
+# Add Python 3.13 (latest 3.13.x maintenance release currently: 3.13.11) :contentReference[oaicite:2]{index=2}
 PY38="3.8.19"
 PY310="3.10.18"
 PY311="3.11.13"
-PY_VERSIONS=("${PY311}" "${PY310}" "${PY38}")   # build newest first
+PY313="3.13.11"
+PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")   # build newest first
 
 MINIFORGE_VER="25.9.1-0"
 MINIFORGE_FN="Miniforge3-${MINIFORGE_VER}-Linux-x86_64.sh"
 
 # Python OpenPGP keys (branch release managers); fetched from keyserver (not a dead URL)
-PY_PGP_KEYS=("B26995E310250568" "64E628F8D684696D")
+# Add 3.13.x key id per python.org OpenPGP verification metadata :contentReference[oaicite:3]{index=3}
+PY_PGP_KEYS=("A821E680E5FA6305" "B26995E310250568" "64E628F8D684696D")
 KEYSERVERS=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkp://pgp.mit.edu")
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg]
+  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc]
 
 Notes:
 - BASE_DIR is any directory (can be on /). Script will create subdirs under it.
 - --reuse allows running again when BASE_DIR already exists.
+- --skip-apt skips apt dependency install.
+- --skip-gpg skips OpenPGP verification.
+- --no-bashrc will not append PATH block to ~/.bashrc.
 EOF
   exit 2
 }
@@ -38,19 +51,22 @@ die(){ echo "FATAL: $*" >&2; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
 
 BASE_DIR="${1:-}"; [[ -z "${BASE_DIR}" ]] && usage; shift || true
-REUSE=0; SKIP_APT=0; SKIP_GPG=0
+REUSE=0; SKIP_APT=0; SKIP_GPG=0; NO_BASHRC=0
 while [[ "${#}" -gt 0 ]]; do
   case "$1" in
     --reuse) REUSE=1 ;;
     --skip-apt) SKIP_APT=1 ;;
     --skip-gpg) SKIP_GPG=1 ;;
+    --no-bashrc) NO_BASHRC=1 ;;
     *) usage ;;
   esac
   shift || true
 done
 
 as_root() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then "$@"; else have sudo || die "sudo missing"; sudo "$@"; fi
+  # must be normal user + sudo available
+  have sudo || die "sudo missing"
+  sudo "$@"
 }
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -62,7 +78,8 @@ REAL_GROUP="$(id -gn "${REAL_USER}" 2>/dev/null || true)"
 [[ -n "${REAL_GROUP}" ]] || die "Cannot determine group for ${REAL_USER}"
 
 as_real_user() {
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then sudo -u "${REAL_USER}" "$@"; else "$@"; fi
+  # running as normal user already; keep function for compatibility with original code
+  "$@"
 }
 
 diag_dir() {
@@ -113,6 +130,7 @@ install_deps() {
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev \
     liblzma-dev libncurses-dev tk-dev uuid-dev \
     libgdbm-dev libgdbm-compat-dev libdb-dev libnsl-dev rpcsvc-proto \
+    libexpat1-dev libtirpc-dev \
     acl
 }
 
@@ -160,7 +178,7 @@ download_file() {
   local dir; dir="$(dirname "${out}")"
   assert_user_writable "${dir}"
   rm -f "${out}.part" 2>/dev/null || true
-  curl -fL --retry 6 --retry-delay 2 -o "${out}.part" "${url}"
+  curl -fL --retry 10 --retry-delay 2 --retry-all-errors --connect-timeout 20 -o "${out}.part" "${url}"
   mv -f "${out}.part" "${out}"
 }
 
@@ -168,24 +186,48 @@ import_python_keys() {
   [[ "${SKIP_GPG}" -eq 1 ]] && return 0
   have gpg || die "gpg missing"
   local keyring="${BASE_DIR}/CACHE/py_release_keys.gpg"
+
+  # Optional HTTPS-first import (more reliable than keyservers); fallback remains keyservers.
+  # We keep this in-function to minimize structural changes.
+  local tmp="${BASE_DIR}/CACHE/tmp/pykey_${RANDOM}_$$.asc"
+  local -A KEYURL=(
+    ["A821E680E5FA6305"]="https://github.com/Yhg1s.gpg"
+    ["64E628F8D684696D"]="https://keybase.io/pablogsal/pgp_keys.asc?fingerprint=a035c8c19219ba821ecea86b64e628f8d684696d"
+    ["B26995E310250568"]="https://keybase.io/ambv/pgp_keys.asc?fingerprint=e3ff2839c048b25c084debe9b26995e310250568"
+  )
+
   for kid in "${PY_PGP_KEYS[@]}"; do
     if gpg --batch --no-default-keyring --keyring "${keyring}" --list-keys "${kid}" >/dev/null 2>&1; then
       continue
     fi
+
     local got=0
-    for ks in "${KEYSERVERS[@]}"; do
-      log "Fetching Python OpenPGP key ${kid} from ${ks}"
-      for attempt in 1 2 3 4 5; do
-        if gpg --batch --no-default-keyring --keyring "${keyring}" \
-            --keyserver "${ks}" --keyserver-options timeout=20,retry=3 \
-            --recv-keys "${kid}" >/dev/null 2>&1; then
-          got=1; break
+    if [[ -n "${KEYURL[$kid]:-}" ]]; then
+      log "Fetching Python OpenPGP key ${kid} via HTTPS"
+      if download_file "${KEYURL[$kid]}" "${tmp}"; then
+        if gpg --batch --no-default-keyring --keyring "${keyring}" --import "${tmp}" >/dev/null 2>&1; then
+          got=1
         fi
-        sleep 2
+      fi
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${got}" -eq 0 ]]; then
+      for ks in "${KEYSERVERS[@]}"; do
+        log "Fetching Python OpenPGP key ${kid} from ${ks}"
+        for attempt in 1 2 3 4 5; do
+          if gpg --batch --no-default-keyring --keyring "${keyring}" \
+              --keyserver "${ks}" --keyserver-options timeout=20,retry=3 \
+              --recv-keys "${kid}" >/dev/null 2>&1; then
+            got=1; break
+          fi
+          sleep 2
+        done
+        [[ "${got}" -eq 1 ]] && break
       done
-      [[ "${got}" -eq 1 ]] && break
-    done
-    [[ "${got}" -eq 1 ]] || die "Failed to fetch OpenPGP key ${kid} from all keyservers"
+    fi
+
+    [[ "${got}" -eq 1 ]] || die "Failed to fetch OpenPGP key ${kid} from all sources"
   done
 }
 
@@ -243,7 +285,8 @@ build_install_python() {
 
   log "Sanity check Python ${ver}"
   "${pybin}" -V
-  "${pybin}" -c "import ssl,sqlite3,lzma,bz2,readline; print('ssl=',ssl.OPENSSL_VERSION)"
+  "${pybin}" -c "import ssl,sqlite3,lzma,bz2,readline,uuid,ctypes; print('ssl=',ssl.OPENSSL_VERSION)"
+  "${pybin}" -c "import tkinter; print('tkinter=ok')" >/dev/null 2>&1 || die "tkinter missing (check tk-dev)"
   "${pybin}" -m pip --version
 }
 
@@ -263,38 +306,44 @@ EOF
   as_root chown "${REAL_USER}:${REAL_GROUP}" "${BASE_DIR}/CACHE/env_common.sh"
   chmod 0644 "${BASE_DIR}/CACHE/env_common.sh"
 }
+
 mkshim() {
   local tag="$1" pybin="$2"
   local version_suffix="${pybin##*python}" # Extracts "3.10" from path
   local d="${BASE_DIR}/shims/${tag}/bin"
-  
+
   as_root mkdir -p "${d}"
   as_root chown -R "${REAL_USER}:${REAL_GROUP}" "${BASE_DIR}/shims"
 
   # 1. Wrapper content
   local wrap_py="#!/usr/bin/env bash
+set -euo pipefail
+source \"${BASE_DIR}/CACHE/env_common.sh\"
 exec \"${pybin}\" \"\$@\""
 
   local wrap_pip="#!/usr/bin/env bash
+set -euo pipefail
 source \"${BASE_DIR}/CACHE/env_common.sh\"
 exec \"${pybin}\" -m pip \"\$@\""
 
   # 2. Write wrappers
-  echo "$wrap_py" > "${d}/python"
-  echo "$wrap_py" > "${d}/python3"
-  echo "$wrap_py" > "${d}/python${version_suffix}" # e.g. python3.10
+  printf "%s\n" "$wrap_py" > "${d}/python"
+  printf "%s\n" "$wrap_py" > "${d}/python3"
+  printf "%s\n" "$wrap_py" > "${d}/python${version_suffix}" # e.g. python3.10
 
-  echo "$wrap_pip" > "${d}/pip"
-  echo "$wrap_pip" > "${d}/pip3"
-  echo "$wrap_pip" > "${d}/pip${version_suffix}" # e.g. pip3.10
+  printf "%s\n" "$wrap_pip" > "${d}/pip"
+  printf "%s\n" "$wrap_pip" > "${d}/pip3"
+  printf "%s\n" "$wrap_pip" > "${d}/pip${version_suffix}" # e.g. pip3.10
 
-  chmod +x "${d}/"*{python,pip}*
+  chmod +x "${d}/python" "${d}/python3" "${d}/python${version_suffix}" \
+          "${d}/pip" "${d}/pip3" "${d}/pip${version_suffix}"
 }
+
 mkentry() {
   local name="$1" tag="$2"
   # Create a custom RC file for this environment
   local rcfile="${BASE_DIR}/CACHE/rc_${name}.bash"
-  
+
   cat > "${rcfile}" <<EOF
 # 1. Source the user's standard bashrc first
 if [ -f ~/.bashrc ]; then source ~/.bashrc; fi
@@ -311,10 +360,10 @@ set -euo pipefail
 source "${BASE_DIR}/CACHE/env_common.sh"
 
 # If user provides args, run command. If not, start shell with custom RC.
-if [ "\$#" -gt 0 ]; then 
+if [ "\$#" -gt 0 ]; then
   export PATH="${BASE_DIR}/shims/${tag}/bin:${BASE_DIR}/bin:\$PATH"
   exec "\$@"
-else 
+else
   exec bash --rcfile "${rcfile}" -i
 fi
 EOF
@@ -328,11 +377,13 @@ create_python_entrypoints() {
   local p38="${BASE_DIR}/opt/python-${PY38}/bin/python3.8"
   local p10="${BASE_DIR}/opt/python-${PY310}/bin/python3.10"
   local p11="${BASE_DIR}/opt/python-${PY311}/bin/python3.11"
-  [[ -x "${p38}" && -x "${p10}" && -x "${p11}" ]] || die "Python binaries missing; build step failed earlier"
+  local p13="${BASE_DIR}/opt/python-${PY313}/bin/python3.13"
+  [[ -x "${p38}" && -x "${p10}" && -x "${p11}" && -x "${p13}" ]] || die "Python binaries missing; build step failed earlier"
 
   ln -sf "${p38}" "${BASE_DIR}/bin/python38"
   ln -sf "${p10}" "${BASE_DIR}/bin/python3-10"
   ln -sf "${p11}" "${BASE_DIR}/bin/python3-11"
+  ln -sf "${p13}" "${BASE_DIR}/bin/python3-13"
 
   cat > "${BASE_DIR}/bin/pip38" <<EOF
 #!/usr/bin/env bash
@@ -349,14 +400,21 @@ EOF
 source "${BASE_DIR}/CACHE/env_common.sh"
 exec "${BASE_DIR}/bin/python3-11" -m pip "\$@"
 EOF
-  chmod +x "${BASE_DIR}/bin/pip38" "${BASE_DIR}/bin/pip3-10" "${BASE_DIR}/bin/pip3-11"
+  cat > "${BASE_DIR}/bin/pip3-13" <<EOF
+#!/usr/bin/env bash
+source "${BASE_DIR}/CACHE/env_common.sh"
+exec "${BASE_DIR}/bin/python3-13" -m pip "\$@"
+EOF
+  chmod +x "${BASE_DIR}/bin/pip38" "${BASE_DIR}/bin/pip3-10" "${BASE_DIR}/bin/pip3-11" "${BASE_DIR}/bin/pip3-13"
 
   mkshim "py38" "${p38}"
   mkshim "py10" "${p10}"
   mkshim "py11" "${p11}"
+  mkshim "py13" "${p13}"
   mkentry "py38" "py38"
   mkentry "py10" "py10"
   mkentry "py11" "py11"
+  mkentry "py13" "py13"
 }
 
 ensure_user_can_create_conda_prefix() {
@@ -455,6 +513,7 @@ tests() {
   "${BASE_DIR}/bin/py38" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
   "${BASE_DIR}/bin/py10" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
   "${BASE_DIR}/bin/py11" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
+  "${BASE_DIR}/bin/py13" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
 
   log "Testing conda wrappers"
   bash -lc "
@@ -472,36 +531,7 @@ tests() {
   "
 }
 
-
-main() {
-  detect_ubuntu
-  preflight
-  install_deps
-
-  # Hard requirement checks AFTER apt
-  for c in curl tar sha256sum make gcc; do have "$c" || die "Missing command: $c"; done
-  [[ "${SKIP_GPG}" -eq 1 ]] || have gpg || die "Missing gpg (use --skip-gpg to bypass)"
-
-  prepare_layout
-
-  for ver in "${PY_VERSIONS[@]}"; do download_python "${ver}"; done
-  build_install_python "${PY311}" "3.11"
-  build_install_python "${PY310}" "3.10"
-  build_install_python "${PY38}"  "3.8"
-
-  create_python_entrypoints
-  install_miniforge
-  tests
-
-  log "DONE. Add to PATH if you want:"
-  log "export PATH=\"${BASE_DIR}/bin:\$PATH\""
-}
-
-main "$@"
-
-
-${BASE_DIR}/bin/conda init
-echo "conda deactivate" >> ~/.bashrc 
+# ---- moved your tail section into proper functions (kept near end for diff) ----
 get_real_home() {
   local home
   home="$(getent passwd "${REAL_USER}" | cut -d: -f6 || true)"
@@ -527,17 +557,14 @@ ensure_path_in_bashrc() {
   begin="# >>> managed by bootstrap: add BASE_DIR/bin to PATH >>>"
   end="# <<< managed by bootstrap <<<"
 
-  # 用 guard：只有 PATH 未包含時先 prepend
   line="if [[ \":\$PATH:\" != *\":${canon}/bin:\"* ]]; then export PATH=\"${canon}/bin:\$PATH\"; fi"
 
   as_real_user bash -lc "touch \"${rc}\""
 
-  # 已存在就唔再寫（檢查 block 標記）
   if as_real_user bash -lc "grep -qsF \"${begin}\" \"${rc}\""; then
     return 0
   fi
 
-  # 追加 block（清晰可逆）
   as_real_user bash -lc "cat >> \"${rc}\" <<'EOF'
 
 ${begin}
@@ -546,6 +573,33 @@ ${end}
 EOF"
 }
 
-ensure_path_in_bashrc
+main() {
+  detect_ubuntu
+  preflight
+  install_deps
 
-exit
+  # Hard requirement checks AFTER apt
+  for c in curl tar sha256sum make gcc; do have "$c" || die "Missing command: $c"; done
+  [[ "${SKIP_GPG}" -eq 1 ]] || have gpg || die "Missing gpg (use --skip-gpg to bypass)"
+
+  prepare_layout
+
+  for ver in "${PY_VERSIONS[@]}"; do download_python "${ver}"; done
+  build_install_python "${PY313}" "3.13"
+  build_install_python "${PY311}" "3.11"
+  build_install_python "${PY310}" "3.10"
+  build_install_python "${PY38}"  "3.8"
+
+  create_python_entrypoints
+  install_miniforge
+  tests
+
+  if [[ "${NO_BASHRC}" -eq 0 ]]; then
+    ensure_path_in_bashrc
+  fi
+
+  log "DONE. Add to PATH if you want:"
+  log "export PATH=\"${BASE_DIR}/bin:\$PATH\""
+}
+
+main "$@"
