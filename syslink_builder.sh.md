@@ -1,6 +1,5 @@
 # example run
 ```
 
-python -m client.cli run --state-path /home/waito/program_self/Fim/data/state.json  --log-path /home/waito/program_self/Fim/log/client.log
-
+bash syslink_builder.sh ~/Comfyui/models  /mnt/disk1/Comfyui/models /mnt/disk2/Comfyui/models /mnt/disk3/Comfyui/models 
 ```
