@@ -30,11 +30,14 @@ MINIFORGE_FN="Miniforge3-${MINIFORGE_VER}-Linux-x86_64.sh"
 # Add 3.13.x key id per python.org OpenPGP verification metadata :contentReference[oaicite:3]{index=3}
 PY_PGP_KEYS=("A821E680E5FA6305" "B26995E310250568" "64E628F8D684696D")
 KEYSERVERS=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkp://pgp.mit.edu")
+REUSE=0; SKIP_APT=0; SKIP_GPG=0; NO_BASHRC=0
+NO_SUDO=0       # <--- ADDED
+WANT_PYS=""     # <--- ADDED
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc]
+  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.10"]
 
 Notes:
 - BASE_DIR is any directory (can be on /). Script will create subdirs under it.
@@ -58,15 +61,22 @@ while [[ "${#}" -gt 0 ]]; do
     --skip-apt) SKIP_APT=1 ;;
     --skip-gpg) SKIP_GPG=1 ;;
     --no-bashrc) NO_BASHRC=1 ;;
+    --no-sudo) NO_SUDO=1 ;;          # <--- ADDED
+    --py) shift; WANT_PYS="$1" ;;    # <--- ADDED (e.g. "3.13 3.10")
     *) usage ;;
   esac
   shift || true
 done
-
 as_root() {
-  # must be normal user + sudo available
-  have sudo || die "sudo missing"
-  sudo "$@"
+  if [[ "${NO_SUDO}" -eq 1 ]]; then
+    # In no-sudo mode, we are the user. 
+    # 'chown' is usually pointless (we own what we create) or fails. Ignore it.
+    if [[ "$1" == "chown" ]]; then return 0; fi
+    "$@"
+  else
+    have sudo || die "sudo missing"
+    sudo "$@"
+  fi
 }
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -369,52 +379,48 @@ fi
 EOF
   chmod +x "${BASE_DIR}/bin/${name}"
 }
-
 create_python_entrypoints() {
   log "Creating python shims + entrypoints"
   write_env_common
 
+  # Define where binaries SHOULD be
   local p38="${BASE_DIR}/opt/python-${PY38}/bin/python3.8"
   local p10="${BASE_DIR}/opt/python-${PY310}/bin/python3.10"
   local p11="${BASE_DIR}/opt/python-${PY311}/bin/python3.11"
   local p13="${BASE_DIR}/opt/python-${PY313}/bin/python3.13"
-  [[ -x "${p38}" && -x "${p10}" && -x "${p11}" && -x "${p13}" ]] || die "Python binaries missing; build step failed earlier"
 
-  ln -sf "${p38}" "${BASE_DIR}/bin/python38"
-  ln -sf "${p10}" "${BASE_DIR}/bin/python3-10"
-  ln -sf "${p11}" "${BASE_DIR}/bin/python3-11"
-  ln -sf "${p13}" "${BASE_DIR}/bin/python3-13"
+  # --- Helper function to safely register a version ---
+  register_python() {
+    local binary="$1"
+    local short="$2"   # e.g. "38" or "3-10"
+    local tag="$3"     # e.g. "py38"
 
-  cat > "${BASE_DIR}/bin/pip38" <<EOF
-#!/usr/bin/env bash
-source "${BASE_DIR}/CACHE/env_common.sh"
-exec "${BASE_DIR}/bin/python38" -m pip "\$@"
-EOF
-  cat > "${BASE_DIR}/bin/pip3-10" <<EOF
-#!/usr/bin/env bash
-source "${BASE_DIR}/CACHE/env_common.sh"
-exec "${BASE_DIR}/bin/python3-10" -m pip "\$@"
-EOF
-  cat > "${BASE_DIR}/bin/pip3-11" <<EOF
-#!/usr/bin/env bash
-source "${BASE_DIR}/CACHE/env_common.sh"
-exec "${BASE_DIR}/bin/python3-11" -m pip "\$@"
-EOF
-  cat > "${BASE_DIR}/bin/pip3-13" <<EOF
-#!/usr/bin/env bash
-source "${BASE_DIR}/CACHE/env_common.sh"
-exec "${BASE_DIR}/bin/python3-13" -m pip "\$@"
-EOF
-  chmod +x "${BASE_DIR}/bin/pip38" "${BASE_DIR}/bin/pip3-10" "${BASE_DIR}/bin/pip3-11" "${BASE_DIR}/bin/pip3-13"
+    if [[ -x "${binary}" ]]; then
+      log "Linking ${tag} -> ${binary}"
+      
+      # 1. Main Symlink
+      ln -sf "${binary}" "${BASE_DIR}/bin/python${short}"
 
-  mkshim "py38" "${p38}"
-  mkshim "py10" "${p10}"
-  mkshim "py11" "${p11}"
-  mkshim "py13" "${p13}"
-  mkentry "py38" "py38"
-  mkentry "py10" "py10"
-  mkentry "py11" "py11"
-  mkentry "py13" "py13"
+      # 2. Pip Wrapper
+      cat > "${BASE_DIR}/bin/pip${short}" <<EOF
+#!/usr/bin/env bash
+source "${BASE_DIR}/CACHE/env_common.sh"
+exec "${BASE_DIR}/bin/python${short}" -m pip "\$@"
+EOF
+      chmod +x "${BASE_DIR}/bin/pip${short}"
+
+      # 3. Shims & Entry
+      mkshim "${tag}" "${binary}"
+      mkentry "${tag}" "${tag}"
+    fi
+  }
+  # ---------------------------------------------------
+
+  # Process each version independently (skipping missing ones)
+  register_python "${p38}" "38"   "py38"
+  register_python "${p10}" "3-10" "py10"
+  register_python "${p11}" "3-11" "py11"
+  register_python "${p13}" "3-13" "py13"
 }
 
 ensure_user_can_create_conda_prefix() {
@@ -510,12 +516,27 @@ EOF
 
 tests() {
   log "Testing python shims"
-  "${BASE_DIR}/bin/py38" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
-  "${BASE_DIR}/bin/py10" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
-  "${BASE_DIR}/bin/py11" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
-  "${BASE_DIR}/bin/py13" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
+
+  # Helper to run test only if the binary exists
+  run_test_if_exists() {
+    local bin="$1"
+    if [[ -x "${bin}" ]]; then
+      log "Testing ${bin}..."
+      "${bin}" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
+    else
+      # Optional: log that we are skipping it
+      # log "Skipping ${bin} (not installed)"
+      :
+    fi
+  }
+
+  run_test_if_exists "${BASE_DIR}/bin/py38"
+  run_test_if_exists "${BASE_DIR}/bin/py10"
+  run_test_if_exists "${BASE_DIR}/bin/py11"
+  run_test_if_exists "${BASE_DIR}/bin/py13"
 
   log "Testing conda wrappers"
+  # Conda is always installed by this script, so we test it unconditionally
   bash -lc "
     set -euo pipefail
     source \"${BASE_DIR}/CACHE/env_common.sh\"
@@ -573,6 +594,11 @@ ${end}
 EOF"
 }
 
+should_proc() {
+  [[ -z "${WANT_PYS}" ]] && return 0
+  [[ " ${WANT_PYS} " == *" $1 "* ]]
+}
+
 main() {
   detect_ubuntu
   preflight
@@ -584,11 +610,21 @@ main() {
 
   prepare_layout
 
-  for ver in "${PY_VERSIONS[@]}"; do download_python "${ver}"; done
-  build_install_python "${PY313}" "3.13"
-  build_install_python "${PY311}" "3.11"
-  build_install_python "${PY310}" "3.10"
-  build_install_python "${PY38}"  "3.8"
+
+  # Filtered Download Loop
+  for ver in "${PY_VERSIONS[@]}"; do 
+    # Extract "3.13" from "3.13.11"
+    local short="${ver%.*}" 
+    if should_proc "${short}"; then
+      download_python "${ver}"
+    fi
+  done
+
+  # Filtered Build Steps
+  if should_proc "3.13"; then build_install_python "${PY313}" "3.13"; fi
+  if should_proc "3.11"; then build_install_python "${PY311}" "3.11"; fi
+  if should_proc "3.10"; then build_install_python "${PY310}" "3.10"; fi
+  if should_proc "3.8";  then build_install_python "${PY38}"  "3.8";  fi
 
   create_python_entrypoints
   install_miniforge
@@ -597,9 +633,8 @@ main() {
   if [[ "${NO_BASHRC}" -eq 0 ]]; then
     ensure_path_in_bashrc
   fi
-
-  log "DONE. Add to PATH if you want:"
-  log "export PATH=\"${BASE_DIR}/bin:\$PATH\""
+  
+  log "DONE."
 }
 
 main "$@"
