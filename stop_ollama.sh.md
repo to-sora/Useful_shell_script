@@ -1,13 +1,17 @@
 # stop_ollama.sh
 
-Stops all running Ollama models.
-
-## Usage
-
 ```bash
-./stop_ollama.sh
+#!/bin/bash
+
+# Get the list of running models from `ollama ps` command
+models=$(ollama ps)
+
+# Loop through each model and extract the ID
+for model in $models; do
+    # Extract the ID from the line
+    id=$(echo "$model" | awk '{print $2}')
+
+    # Stop the model using `ollama stop` command
+    ollama stop $id
+done
 ```
-
-## Notes
-
-- Requires `ollama` to be installed and on `PATH`.

@@ -1,14 +1,5 @@
 # restart_gui.sh
 
-Restarts the LightDM display manager.
-
-## Usage
-
 ```bash
-./restart_gui.sh
+sudo systemctl restart lightdm
 ```
-
-## Notes
-
-- Requires `sudo` privileges.
-- This will restart your graphical session.
