@@ -13,10 +13,12 @@ Each script has a matching `.md` file with requirements and usage examples.
 | [download_hf.sh](download_hf.sh) | Download a Hugging Face dataset with retries. | [download_hf.sh.md](download_hf.sh.md) |
 | [fan.sh](fan.sh) | Placeholder script (no actions). | [fan.sh.md](fan.sh.md) |
 | [game_fan.sh](game_fan.sh) | Set GPU fan manual mode to 60%. | [game_fan.sh.md](game_fan.sh.md) |
+| [get_boot_order.sh](get_boot_order.sh) | List Proxmox VMs and containers in startup order. | [get_boot_order.sh.md](get_boot_order.sh.md) |
 | [get_py_env_detail.sh](get_py_env_detail.sh) | Scan for Python venvs and export `pip freeze` output. | [get_py_env_detail.md](get_py_env_detail.md) |
 | [get_repo_size.sh](get_repo_size.sh) | Report Git repo sizes and upstream info. | [get_repo_size.sh.md](get_repo_size.sh.md) |
 | [get_vev_size.sh](get_vev_size.sh) | Report sizes of Python virtual environments. | [get_vev_size.sh.md](get_vev_size.sh.md) |
 | [install_python.sh](install_python.sh) | Install multiple Python versions and Miniforge on Ubuntu. | [install_python.md](install_python.md) |
+| [install_metube.sh](install_metube.sh) | Install Docker and deploy MeTube (YouTube downloader). | [install_metube.sh.md](install_metube.sh.md) |
 | [lim_power_low.sh](lim_power_low.sh) | Set a lower GPU power limit (default 200W) and apply clocks. | [lim_power_low.sh.md](lim_power_low.sh.md) |
 | [lim_power.sh](lim_power.sh) | Set a GPU power limit (default 350W) and apply clocks. | [lim_power.sh.md](lim_power.sh.md) |
 | [ltree](ltree) | Print directory trees with depth limits and optional output. | [ltree.md](ltree.md) |
@@ -32,4 +34,5 @@ Each script has a matching `.md` file with requirements and usage examples.
 | [reset_power.sh](reset_power.sh) | Reset GPU power and clock settings to a profile. | [reset_power.sh.md](reset_power.sh.md) |
 | [restart_gui.sh](restart_gui.sh) | Restart the LightDM display manager. | [restart_gui.sh.md](restart_gui.sh.md) |
 | [stop_ollama.sh](stop_ollama.sh) | Stop all running Ollama models. | [stop_ollama.sh.md](stop_ollama.sh.md) |
+| [syslink_builder.sh](syslink_builder.sh) | Create symlinks mirroring files from multiple source directories. | [syslink_builder.sh.md](syslink_builder.sh.md) |
 | [xray_set.sh](xray_set.sh) | Set HTTP/HTTPS/SOCKS proxy variables for xray. | [xray_set.sh.md](xray_set.sh.md) |

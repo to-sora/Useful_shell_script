@@ -1,110 +1,106 @@
-# 🐍 Python Multi-Version + Conda Bootstrapper
+# install_python.sh
 
-一鍵式在 **Ubuntu** 系統上安裝多版本 Python（Build from Source）+ Conda（Miniforge）開發環境。  
+Install multiple Python versions from source and Miniforge (conda) on Ubuntu.
 
-## 📦 安裝內容
+## Requirements
+- Ubuntu 20.04 or newer
+- Run as normal user (not root/sudo)
+- Internet access for downloads
+- `sudo` access for apt package installation (unless using `--skip-apt` and `--no-sudo`)
 
-| 類型     | 說明                                         |
-|----------|----------------------------------------------|
-| Python   | 3.8.19, 3.10.18, 3.11.13（源碼編譯）           |
-| Conda    | Miniforge 25.9.1-0，自動初始化 `.bashrc`     |
-| Shims    | 自動產生 `py38`, `py10`, `py11`, `cbase`, `cenv` 等指令入口 |
-| Cache    | 自動配置 HuggingFace / pip / torch / ollama 等目錄 |
+## What it installs
+- **Python versions**: 3.8.19, 3.10.18, 3.11.13, 3.13.11 (compiled from source)
+- **Miniforge**: 25.9.1-0 (conda/mamba package manager)
+- **Entry scripts**: `py38`, `py10`, `py11`, `py13`, `python3-8`, `pip3-11`, etc.
+- **Conda wrappers**: `cbase` (base environment), `cenv <envname>` (activate environment)
+- **Cache directories**: Pre-configured for pip, HuggingFace, torch, ollama
 
----
-
-## ⚙️ 系統需求
-
-- 作業系統：Ubuntu 20.04 或更新版本
-- 套件工具：`sudo`, `curl`, `gcc`, `make`, `gpg`, `tar` 等（可自動安裝）
-
-bash bootstrap.sh /path/to/my_env
-```
-
-### 進階選項
-
-| 參數         | 說明                              |
-|--------------|-----------------------------------|
-| `--reuse`     | 若目錄已存在則重用，不重新初始化 |
-| `--skip-apt`  | 不執行 `apt install`             |
-| `--skip-gpg`  | 不驗證 Python PGP 簽章 |
-
----
-
-## 🧪 使用方法
-
-### 🔢 啟用特定 Python 版本
-
+## Usage
 ```bash
-/path/to/my_env/bin/py38      # 啟用 Python 3.8 環境
-/path/to/my_env/bin/py10      # 啟用 Python 3.10 環境
-/path/to/my_env/bin/py11      # 啟用 Python 3.11 環境
+./install_python.sh <BASE_DIR> [OPTIONS]
 ```
 
-這些會開啟一個新 shell，`python` 和 `pip` 將對應正確版本。
-
-也可直接執行：
-
+### Basic example
 ```bash
-py11 python my_script.py
-py38 pip install -r requirements.txt
+./install_python.sh /path/to/myenv
 ```
 
----
+### Options
+| Flag | Description |
+|------|-------------|
+| `--reuse` | Allow running when BASE_DIR already exists (skip completed steps) |
+| `--skip-apt` | Skip apt dependency installation |
+| `--skip-gpg` | Skip OpenPGP signature verification for Python downloads |
+| `--no-bashrc` | Do not modify `~/.bashrc` with PATH additions |
+| `--no-sudo` | Do not use sudo (for environments without sudo access) |
+| `--py "3.13 3.11"` | Install only specified Python versions (space-separated) |
 
-### 📦 使用 Conda
-
+### Selective installation example
 ```bash
-/path/to/my_env/bin/cbase          # 啟動 base conda 環境
-/path/to/my_env/bin/cenv myenv     # 啟動指定 conda 環境
-/path/to/my_env/bin/cenv myenv jupyter lab
+# Install only Python 3.13 and 3.11
+./install_python.sh /path/to/myenv --py "3.13 3.11"
 ```
 
-#### 📌 注意事項
-
-- `conda init` 已自動執行（**無需手動設定 shell**）
-- 為防止污染系統環境，腳本會自動在 `~/.bashrc` 中加入：
-  ```bash
-  conda deactivate
-  ```
-  保證登入時 Conda 不會強制啟用 base 環境。
-
----
-
-## 📁 環境目錄結構
-
+## Directory structure
+After installation, `BASE_DIR` will contain:
 ```
-my_env/
-├── bin/            # 所有入口指令 py38/py11/cenv/cbase
-├── opt/            # 安裝好的 Python 與 Conda
-├── src/            # Python 原始碼
-├── CACHE/
-│   ├── pip/        # pip 快取
-│   ├── hf/         # HuggingFace 快取
-│   ├── conda/      # Conda 快取 + 設定
-│   └── tmp/        # 暫存檔案
+BASE_DIR/
+├── bin/           # Entry scripts: py38, py11, py13, cbase, cenv, conda
+├── opt/           # Installed Python versions and Miniforge
+│   ├── python-3.8.19/
+│   ├── python-3.10.18/
+│   ├── python-3.11.13/
+│   ├── python-3.13.11/
+│   └── conda/     # Miniforge installation
+├── src/           # Python source tarballs
+├── shims/         # Version-specific entry points
+└── CACHE/         # Cache directories
+    ├── pip/
+    ├── hf/        # HuggingFace
+    ├── torch/
+    ├── ollama/
+    └── conda/
 ```
 
----
+## Using installed Python versions
+After adding `BASE_DIR/bin` to your PATH (done automatically unless `--no-bashrc` is used):
 
-## 🧼 移除環境
-
-```bash 
-sudo rm -rf /path/to/my_env
+### Direct version commands
+```bash
+python3-11 --version       # Run Python 3.11 directly
+pip3-13 install requests   # Use pip for Python 3.13
 ```
-And remember clear .bashrc
----
 
-## ❓常見問題
+### Shell wrappers (recommended)
+```bash
+py11 bash -c 'python -V'              # Opens shell with Python 3.11
+py13 python script.py                 # Run script with Python 3.13
+py38 pip install -r requirements.txt  # Install packages with Python 3.8
+```
 
-### Q: 可以在 WSL2 或 Debian 上用嗎？  
-目前腳本僅支援 Ubuntu，其餘請修改 `detect_ubuntu()` 判斷。
+### Conda usage
+```bash
+cbase                           # Activate conda base environment
+cenv myenv                      # Activate conda environment 'myenv'
+cenv myenv jupyter lab          # Run command in conda environment
+conda create -n myenv python=3.11
+```
 
-### Q: 安裝中斷後重跑會怎樣？  
-加上 `--reuse` 可略過已完成步驟（如下載與編譯）。
+## Notes
+- Script validates Python downloads with OpenPGP signatures from keyservers
+- All Python versions are built with `--enable-optimizations` (takes longer but faster runtime)
+- Conda is configured to NOT auto-activate base environment on shell startup
+- If installation is interrupted, use `--reuse` to resume without re-downloading/rebuilding
+- The `--py` flag is useful for faster installs when you only need specific versions
+- PATH modifications are appended to `~/.bashrc` automatically (disable with `--no-bashrc`)
 
----
+## Uninstalling
+```bash
+sudo rm -rf /path/to/BASE_DIR
+# Then manually remove the PATH block from ~/.bashrc if added
+```
 
-## 📄 License
-
-MIT License — Free to use and modify.
+## Security
+- Downloads from python.org and github.com (Miniforge)
+- Python tarballs are verified with GPG signatures from official Python release managers
+- Keys fetched from: keyserver.ubuntu.com, keys.openpgp.org, pgp.mit.edu
