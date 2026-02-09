@@ -1,8 +1,17 @@
 # onfan.sh
 
+Set GPU fan control to manual and set target fan speed to a provided value.
+
+## Requirements
+- `nvidia-settings`
+- `sudo` privileges
+- X11 session available at `DISPLAY=:0`
+- Xauthority at `/var/run/lightdm/root/:0`
+
+## Usage
 ```bash
-export DISPLAY=:0
-export XAUTHORITY=/var/run/lightdm/root/:0
-export fanspeed=${1:-70}
-sudo nvidia-settings -a "[gpu:0]/GPUFanControlState=1" -a "[fan:0]/GPUTargetFanSpeed=$fanspeed"
+./onfan.sh [fan_percent]
 ```
+
+## Notes
+- Default fan speed is 70% when no argument is provided.

@@ -1,7 +1,14 @@
 # maxfan.sh
 
+Set GPU fan control to manual and set target fan speed to 95%.
+
+## Requirements
+- `nvidia-settings`
+- `sudo` privileges
+- X11 session available at `DISPLAY=:0`
+- Xauthority at `/var/run/lightdm/root/:0`
+
+## Usage
 ```bash
-export DISPLAY=:0
-export XAUTHORITY=/var/run/lightdm/root/:0
-sudo nvidia-settings -a "[gpu:0]/GPUFanControlState=1" -a "[fan:0]/GPUTargetFanSpeed=95"
+./maxfan.sh
 ```

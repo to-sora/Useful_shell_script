@@ -1,5 +1,6 @@
 # fan.sh
 
-```bash
-# Use sudo to elevate privileges and activate the virtual environment
-```
+Placeholder script. Currently contains only a comment and performs no actions.
+
+## Usage
+No behavior defined yet.
