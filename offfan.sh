@@ -1,3 +1,3 @@
-export DISPLAY=:0
-export XAUTHORITY=/var/run/lightdm/root/:0
-sudo nvidia-settings -a "[gpu:0]/GPUFanControlState=0"
+#!/bin/bash
+DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority nvidia-settings \
+  -a "[gpu:0]/GPUFanControlState=0"

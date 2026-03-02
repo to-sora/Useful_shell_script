@@ -11,4 +11,4 @@ echo $POWER_LIMIT
 sudo nvidia-smi -pm 1
 
 sudo nvidia-smi -pl $POWER_LIMIT
-sudo nvidia-smi -lgc 100,2000
+#sudo nvidia-smi -lgc 100,2000
