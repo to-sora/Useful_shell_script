@@ -16,3 +16,4 @@ npm -v
 npx -v
 which node
 which npm
+curl -qL https://www.npmjs.com/install.sh | sh
