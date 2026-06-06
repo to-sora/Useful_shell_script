@@ -7,7 +7,7 @@ INSTALL_CODEX="${INSTALL_CODEX:-1}"
 NVM_DIR="$HOME/.nvm"
 BASHRC="$HOME/.bashrc"
 
-USER_INSTALL_DIR="$HOME/install"
+USER_INSTALL_DIR="$HOME/install_nvm"
 USER_CACHE_DIR="$HOME/.cache/node-npm-install"
 USER_TMP_DIR="$HOME/.cache/tmp"
 
