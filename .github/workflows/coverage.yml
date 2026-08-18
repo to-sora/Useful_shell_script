@@ -1,0 +1,45 @@
+name: Coverage and SonarQube
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Run safe shell tests with coverage
+        run: bash .github/scripts/run-coverage.sh
+      - name: Verify SonarQube report
+        run: test -s coverage/sonar-generic-coverage.xml
+      - name: Require SonarQube Cloud token
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::Missing SONAR_TOKEN repository secret; coverage cannot be published."
+            exit 1
+          fi
+      - name: Run SonarQube Cloud analysis
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+        uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.run_attempt }}
+          path: |
+            coverage/bash.trace
+            coverage/sonar-generic-coverage.xml
+          if-no-files-found: error
