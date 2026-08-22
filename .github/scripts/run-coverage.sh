@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
 mkdir -p coverage
-: > coverage/bash.trace
+: >coverage/bash.trace
 
 while IFS= read -r -d '' script; do
   bash -n "$script"
@@ -14,16 +14,16 @@ done < <(git ls-files -z '*.sh' 'ltree')
 temp_root="$(mktemp -d)"
 trap 'rm -rf "$temp_root"' EXIT
 mkdir -p "$temp_root/destination" "$temp_root/source-a/nested" "$temp_root/source-b/nested"
-printf 'first\n' > "$temp_root/source-a/nested/shared.txt"
-printf 'second\n' > "$temp_root/source-b/nested/shared.txt"
+printf 'first\n' >"$temp_root/source-a/nested/shared.txt"
+printf 'second\n' >"$temp_root/source-b/nested/shared.txt"
 mkdir -p "$temp_root/fake-venv/bin" "$temp_root/fake-venv/lib"
-: > "$temp_root/fake-venv/bin/activate"
+: >"$temp_root/fake-venv/bin/activate"
 git init -q "$temp_root/repository"
 
 trace() {
   BASH_XTRACEFD=3 \
     PS4='+TRACE:${BASH_SOURCE[0]}:${LINENO}:' \
-    bash -x "$@" 3>> coverage/bash.trace
+    bash -x "$@" 3>>coverage/bash.trace
 }
 
 trace ./syslink_builder.sh \

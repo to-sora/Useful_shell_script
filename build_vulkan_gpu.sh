@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 cd ~/vulkan
 source ~/vulkan/1.4.349.0/setup-env.sh
 

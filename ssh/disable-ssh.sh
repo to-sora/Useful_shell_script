@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # Script to disable SSH access
 
 echo "WARNING: This will disable SSH and close port 22!"

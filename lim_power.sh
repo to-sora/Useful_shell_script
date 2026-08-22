@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 DEFAULT_POWER=350
 MAX_POWER=400
 # Check if the first argument is provided and is a valid number

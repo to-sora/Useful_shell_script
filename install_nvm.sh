@@ -1,4 +1,4 @@
-
+#!/usr/bin/env bash
 
 NVM_VERSION="${NVM_VERSION:-v0.40.4}"
 NODE_VERSION="${NODE_VERSION:-24}"

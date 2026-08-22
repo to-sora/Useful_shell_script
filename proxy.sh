@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # Set HTTP proxy
 export HTTP_PROXY="http://127.0.0.1:10801"
 export HTTPS_PROXY="http://127.0.0.1:10801"

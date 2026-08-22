@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # Run once:
 #   sudo bash install-codex-sqlite-tmpfs.sh
