@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 ls /etc/pve/qemu-server/*.conf /etc/pve/lxc/*.conf 2>/dev/null | \
 while read f; do
   id=$(basename "$f" .conf)

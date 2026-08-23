@@ -1,5 +1,5 @@
-#reset_clone_VM.sh 
 #!/usr/bin/env bash
+# reset_clone_VM.sh
 set -Eeuo pipefail
 # changed if needed
 PROXMOX_HOSTNAME="Proxmox"
@@ -55,4 +55,3 @@ sudo tailscale logout || true
 sudo rm -rf /var/lib/tailscale
 sudo systemctl start tailscaled
 sudo tailscale up --hostname="${TS_HOSTNAME}"
-

@@ -4,7 +4,7 @@ A collection of convenience scripts for managing Proxmox VE and Linux environmen
 
 ## Available Scripts
 
-Each script has a matching `.md` file with requirements and usage examples.
+Most scripts have a matching `.md` file with requirements and usage examples. Scripts that currently rely on inline guidance are summarized in [ADDITIONAL_SCRIPTS.md](ADDITIONAL_SCRIPTS.md).
 
 | Script | Description | Documentation |
 |---|---|---|

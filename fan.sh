@@ -1,2 +1,3 @@
-# Use sudo to elevate privileges and activate the virtual environment
+#!/usr/bin/env bash
 
+# Use sudo to elevate privileges and activate the virtual environment

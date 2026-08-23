@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 qm_list_nic_bridges_color() {
   # --- colour control ---
   local use_color=1

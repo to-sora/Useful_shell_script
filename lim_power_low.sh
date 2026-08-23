@@ -1,7 +1,9 @@
+#!/usr/bin/env bash
+
 DEFAULT_POWER=200
 MAX_POWER=400
 # Check if the first argument is provided and is a valid number
-if [[ $1 =~ ^[0-9]+$ ]] && [ $1 -le $MAX_POWER ] && [$1 -ge 150]; then
+if [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -le "$MAX_POWER" ] && [ "$1" -ge 150 ]; then
     POWER_LIMIT=$1
 else
     POWER_LIMIT=$DEFAULT_POWER
