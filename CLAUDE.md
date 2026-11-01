@@ -70,11 +70,12 @@ Post-clone VM identity reset:
 ### install_python.sh
 Multi-version Python installer:
 - Run as normal user (not root/sudo)
-- Syntax: `bash install_python.sh <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"]`
-- Python versions: 3.8.19, 3.10.18, 3.11.13, 3.13.11 (compiled from source)
+- Syntax: `bash install_python.sh <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--skip-conda] [--jobs N]`
+- Python versions: 3.8.20, 3.10.22, 3.11.18, 3.13.18 (compiled from source)
 - Validates Python downloads with OpenPGP signatures (unless `--skip-gpg`)
 - Installs dependencies via apt (unless `--skip-apt`)
-- Selective installation: Use `--py "3.13 3.11"` to install only specific versions
+- Defaults to 3.11 and 3.13; use `--py` for explicit branch selection. Python 3.8 and 3.10 are end-of-life.
+- `update_python_envs.sh` scans, plans, applies, verifies, and rolls back private CPython patch updates.
 - Creates version-specific entry points in `<BASE_DIR>/bin/` (py38, py10, py11, py13)
 - Optionally modifies `~/.bashrc` to add BASE_DIR to PATH (unless `--no-bashrc`)
 
@@ -126,7 +127,7 @@ bash reset_clone_VM.sh <hostname>  # Run inside cloned VM
 
 ### Working with Python installations
 ```bash
-# Install all Python versions (3.8, 3.10, 3.11, 3.13)
+# Install supported default Python branches (3.11 and 3.13)
 bash install_python.sh /path/to/basedir
 
 # Install only specific versions
