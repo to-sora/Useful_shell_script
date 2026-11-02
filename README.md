@@ -18,7 +18,7 @@ Most scripts have a matching `.md` file with requirements and usage examples. Sc
 | [get_repo_size.sh](get_repo_size.sh) | Report Git repo sizes and upstream info. | [get_repo_size.sh.md](get_repo_size.sh.md) |
 | [get_vev_size.sh](get_vev_size.sh) | Report sizes of Python virtual environments. | [get_vev_size.sh.md](get_vev_size.sh.md) |
 | [install_python.sh](install_python.sh) | Install multiple Python versions and Miniforge on Ubuntu. | [install_python.md](install_python.md) |
-| [update_python_envs.sh](update_python_envs.sh) | Discover and patch private Python installations and venvs with backups and verification. | [update_python_envs.md](update_python_envs.md) |
+| [update_python_envs.sh](update_python_envs.sh) | Native Bash discovery and patch updates for private Python installations and venvs, with backups and verification. | [update_python_envs.md](update_python_envs.md) |
 | [install_metube.sh](install_metube.sh) | Install Docker and deploy MeTube (YouTube downloader). | [install_metube.sh.md](install_metube.sh.md) |
 | [lim_power_low.sh](lim_power_low.sh) | Set a lower GPU power limit (default 200W) and apply clocks. | [lim_power_low.sh.md](lim_power_low.sh.md) |
 | [lim_power.sh](lim_power.sh) | Set a GPU power limit (default 350W) and apply clocks. | [lim_power.sh.md](lim_power.sh.md) |

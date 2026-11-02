@@ -1,720 +1,804 @@
 #!/usr/bin/env bash
-# Standalone Linux CPython patch updater. See update_python_envs.md.
-# Bash starts the embedded standard-library engine; no companion .py is needed.
-set -euo pipefail
-
-updater_python="${PY_ENV_UPDATER_PYTHON:-}"
-if [[ -n "$updater_python" ]]; then
-  command -v -- "$updater_python" >/dev/null 2>&1 || {
-    printf 'ERROR: PY_ENV_UPDATER_PYTHON executable was not found.\n' >&2
-    exit 2
-  }
-else
-  for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8; do
-    if command -v "$candidate" >/dev/null 2>&1 &&
-      "$candidate" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
-      updater_python="$(command -v "$candidate")"
-      break
-    fi
-  done
-fi
-if [[ -z "$updater_python" ]] ||
-  ! "$updater_python" -I -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
-  printf 'ERROR: A control Python >= 3.8 is required; set PY_ENV_UPDATER_PYTHON.\n' >&2
+# Native Bash CPython patch updater. No embedded or generated Python source.
+# See update_python_envs.md for trusted roots, backups, and examples.
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
+MARKER='.pyenv-update-'
+WORK=''
+declare -a ROOTS=() EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
+OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
+declare -A FLOORS=([3.8]=3.8.20 [3.10]=3.10.22 [3.11]=3.11.18 [3.13]=3.13.18)
+declare -A EOL=([3.8]=2024-10-07 [3.9]=2025-10-31 [3.10]=2026-10-01)
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
   exit 2
-fi
+}
+now() { date -u +%FT%TZ; }
+cleanup() { [[ -z "$WORK" ]] || rm -rf -- "$WORK"; }
+trap cleanup EXIT
+usage() {
+  cat <<'HELP'
+Usage:
+  update_python_envs.sh scan ROOT... --output inventory.json
+  update_python_envs.sh plan ROOT... --target MINOR=/patched/bin/python --output plan.json
+  update_python_envs.sh apply ROOT... --target MINOR=/patched/bin/python --output journal.json
+  update_python_envs.sh verify JOURNAL --output verification.json
+  update_python_envs.sh rollback JOURNAL
 
-run_engine() {
-  "$updater_python" -I - "$@" <<'PY_ENV_UPDATE_ENGINE'
-"""Discover and patch private CPython installations and virtual environments.
-
-Python >= 3.8, Linux. Explicit roots and target binaries are required.
-Scan follows directory links, deduplicates inode cycles, and probes actual binaries.
-Patch releases within one minor branch preserve third-party packages. Each update
-uses a staged copy, validation, an adjacent backup, and a durable journal.
-"""
-import argparse
-import datetime
-import fnmatch
-import hashlib
-import json
-import os
-from pathlib import Path
-import re
-import shutil
-import stat
-import subprocess
-import sys
-import time
-import uuid
-import fcntl
-
-PYNAME = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)*)?$")
-MARKER = ".pyenv-update-"
-EOL = {"3.8": "2024-10-07", "3.10": "2026-10-01"}
-PATCH_FLOORS = {"3.8": "3.8.20", "3.10": "3.10.22", "3.11": "3.11.18", "3.13": "3.13.18"}
-PROBE = r'''
-import json,sys,sysconfig,platform,os
-print(json.dumps(dict(version=platform.python_version(), executable=sys.executable,
- prefix=sys.prefix,base_prefix=getattr(sys,'real_prefix',sys.base_prefix),
- implementation=platform.python_implementation(),soabi=sysconfig.get_config_var('SOABI'),
- shared=sysconfig.get_config_var('Py_ENABLE_SHARED'),machine=platform.machine(),
- pointer_bits=__import__('struct').calcsize('P')*8)))
-'''
-PACKAGES = r'''
-import importlib.metadata as m,json,re,os,sys
-out={}; direct=[]; scripts=[]; ignored_metadata=[]
-for d in m.distributions():
- name=d.metadata.get('Name')
- if not name or not d.version:
-  metadata_path=getattr(d,'_path',None)
-  # pip can leave empty dist-info directory trees after an uninstall. They
-  # contain no installed distribution; populated corrupt metadata is an error.
-  if metadata_path and os.path.isdir(metadata_path) and not any(files for _,_,files in os.walk(metadata_path)):
-   ignored_metadata.append(str(metadata_path)); continue
-  raise RuntimeError('Incomplete distribution metadata: '+str(metadata_path))
- name=re.sub('[-_.]+','-',name).lower()
- out[name]=d.version
- if d.read_text('direct_url.json'): direct.append(name)
- for ep in d.entry_points:
-  if ep.group=='console_scripts': scripts.append(ep.name)
-present=[n for n in sorted(set(scripts)) if os.path.isfile(os.path.join(sys.prefix,'bin',n))]
-print(json.dumps(dict(packages=out,direct_url=direct,console_scripts=sorted(set(scripts)),present_console_scripts=present,ignored_empty_metadata=ignored_metadata)))
-'''
-CORE_CHECK = r'''
-import ssl,sqlite3,bz2,lzma,ctypes,venv,json,sys,hashlib,zlib,time
-assert len(time.strftime('%Y'))==4
-assert sqlite3.connect(':memory:').execute('select 6*7').fetchone()[0]==42
-data=b'python-environment-updater'*30
-assert bz2.decompress(bz2.compress(data))==data
-assert lzma.decompress(lzma.compress(data))==data
-print(json.dumps(dict(version=sys.version,openssl=ssl.OPENSSL_VERSION,sqlite=sqlite3.sqlite_version)))
-'''
-
-class UpdateError(Exception): pass
-
-def utcnow():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-def emit(event, **fields):
-    print(json.dumps(dict(event=event, **fields)), flush=True)
-
-def version_tuple(v):
-    if not re.fullmatch(r"\d+\.\d+\.\d+", v):
-        raise UpdateError("A stable three-component CPython version is required: " + v)
-    return tuple(map(int, v.split('.')))
-
-def branch(v): return '.'.join(v.split('.')[:2])
-
-def canon(p): return str(Path(p).resolve())
-
-def within(p, root):
-    try: Path(p).resolve().relative_to(Path(root).resolve()); return True
-    except ValueError: return False
-
-def atomic_json(path, data):
-    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp-' + uuid.uuid4().hex)
-    with tmp.open('w') as f:
-        json.dump(data, f, indent=2, sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, path)
-    fd=os.open(str(path.parent), os.O_DIRECTORY)
-    try: os.fsync(fd)
-    finally: os.close(fd)
-
-def run(argv, timeout=120, cwd=None):
-    env=os.environ.copy()
-    for key in list(env):
-        if key.startswith('PYTHON') or key in ('VIRTUAL_ENV','CONDA_PREFIX'):
-            env.pop(key,None)
-    env['PIP_DISABLE_PIP_VERSION_CHECK']='1'
-    env['PIP_NO_INPUT']='1'
-    try:
-        result=subprocess.run([str(a) for a in argv],cwd=cwd,env=env,timeout=timeout,
-                              text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    except (OSError,subprocess.TimeoutExpired) as e:
-        raise UpdateError(str(e))
-    if result.returncode:
-        raise UpdateError('Command failed (exit '+str(result.returncode)+'): '+repr([str(a) for a in argv])+'\n'+result.stdout[-4000:]+result.stderr[-4000:])
-    return result.stdout
-
-def run_json(binary, code):
-    output=run([binary,'-I','-c',code],timeout=45)
-    try: return json.loads(output)
-    except ValueError: raise UpdateError('Interpreter returned invalid JSON: '+str(binary))
-
-def executable_file(path):
-    try:
-        if not path.is_file() or not os.access(str(path),os.X_OK): return False
-        with path.open('rb') as f: return f.read(4)==b'\x7fELF'
-    except OSError: return False
-
-def probe(binary):
-    # Preserve the invocation path: resolving a venv interpreter link here would
-    # execute its base interpreter outside the environment.
-    binary=Path(os.path.abspath(str(binary)))
-    if not executable_file(binary): raise UpdateError('Missing or non-ELF Python binary: '+str(binary))
-    info=run_json(binary,PROBE)
-    if info['implementation']!='CPython': raise UpdateError('CPython is required')
-    info['prefix']=canon(info['prefix']); info['base_prefix']=canon(info['base_prefix'])
-    info['binary']=str(binary)
-    version_tuple(info['version'])
-    return info
-
-def binary_names(prefix):
-    bindir=Path(prefix)/'bin'
-    if not bindir.is_dir(): return []
-    return sorted((p.name for p in bindir.iterdir() if PYNAME.fullmatch(p.name)),
-                  key=lambda n:(n!='python',n!='python3',n))
-
-def unresolved_aliases(prefix, version):
-    standard={'python','python3','python'+branch(version)}
-    return [name for name in binary_names(prefix)
-            if name not in standard and not executable_file(Path(prefix)/'bin'/name)]
-
-def manager(prefix):
-    p=Path(prefix)
-    if (p/'conda-meta').is_dir():return 'conda'
-    index=p/'info/index.json'
-    if index.is_file():
-        try:
-            if json.loads(index.read_text()).get('name')=='python':return 'conda-package-cache'
-        except (ValueError,OSError):pass
-    return 'private'
-
-def scan(roots, exclude=()):
-    records={}; warnings=[]; links=[]; visited=set(); candidates=[]; cfg_paths=[]
-    excluded=[canon(p) for p in exclude]
-    stack=[Path(os.path.abspath(str(p))) for p in roots]
-    while stack:
-        path=stack.pop()
-        if MARKER in path.name or any(within(path,p) for p in excluded): continue
-        try:
-            if path.is_symlink():
-                links.append(dict(path=str(path),target=canon(path),exists=path.exists()))
-            if not path.exists():
-                warnings.append(dict(path=str(path),reason='broken_link_or_missing_root')); continue
-            if path.is_file():
-                if PYNAME.fullmatch(path.name): candidates.append(path)
-                continue
-            if (path/'pyvenv.cfg').is_file(): cfg_paths.append(path)
-            st=path.stat(); key=(st.st_dev,st.st_ino)
-            if key in visited: continue
-            visited.add(key)
-            with os.scandir(path) as entries:
-                for ent in entries:
-                    p=Path(ent.path)
-                    if MARKER in ent.name: continue
-                    if ent.is_dir(follow_symlinks=True): stack.append(p)
-                    elif ent.name=='pyvenv.cfg': pass
-                    elif path.name=='bin' and PYNAME.fullmatch(ent.name): candidates.append(p)
-                    elif ent.is_symlink() and not p.exists():
-                        warnings.append(dict(path=str(p),reason='broken_link'))
-        except (OSError,RuntimeError) as e:
-            warnings.append(dict(path=str(path),reason=str(e)))
-    # Config markers are useful candidates, but the executable determines identity.
-    for p in cfg_paths:
-        names=binary_names(p)
-        if not names: warnings.append(dict(path=str(p),reason='pyvenv.cfg_without_python_binary'))
-        candidates.extend(p/'bin'/name for name in names)
-    probed=set()
-    for p in candidates:
-        invocation=str(p)
-        if invocation in probed: continue
-        probed.add(invocation)
-        try:
-            info=probe(p); key=info['prefix']
-            kind='venv' if info['prefix']!=info['base_prefix'] else 'raw'
-            rec=records.setdefault(key,dict(prefix=key,kind=kind,version=info['version'],
-                base_prefix=info['base_prefix'],binary=str(Path(key)/'bin'/p.name),
-                aliases=[],binaries=[],versions=[],soabi=info['soabi'],shared=info['shared'],
-                machine=info['machine'],pointer_bits=info['pointer_bits'],
-                managed=manager(key)))
-            rec['aliases'].append(invocation)
-            rec['binaries'].append(dict(path=invocation,version=info['version'],
-                                       resolved=canon(p),prefix=info['prefix']))
-            if info['version'] not in rec['versions']:rec['versions'].append(info['version'])
-        except UpdateError as e: warnings.append(dict(path=invocation,reason=str(e)))
-    # A venv can reference a raw installation beyond the traversal roots.
-    for rec in list(records.values()):
-        base=rec['base_prefix']
-        if rec['kind']=='venv' and base not in records:
-            names=binary_names(base)
-            for name in names:
-                try:
-                    info=probe(Path(base)/'bin'/name)
-                    if branch(info['version'])!=branch(rec['version']): continue
-                    records[base]=dict(prefix=base,kind='raw',version=info['version'],
-                        base_prefix=base,binary=info['binary'],aliases=[info['binary']],
-                        binaries=[dict(path=info['binary'],version=info['version'],resolved=canon(info['binary']),prefix=base)],
-                        versions=[info['version']],soabi=info['soabi'],shared=info['shared'],
-                        machine=info['machine'],pointer_bits=info['pointer_bits'],
-                        managed=manager(base),
-                        referenced_only=True)
-                    break
-                except UpdateError: continue
-    for rec in records.values():
-        rec['unresolved_aliases']=unresolved_aliases(rec['prefix'],rec['version'])
-        rec['binary_errors']=[w for w in warnings if canon(Path(w['path']).parent)==str(Path(rec['prefix'])/'bin')]
-    return dict(created=utcnow(),roots=[os.path.abspath(str(p)) for p in roots],
-                environments=sorted(records.values(),key=lambda r:r['prefix']),
-                warnings=warnings,symlinks=links,visited_directories=len(visited))
-
-def packages(binary): return run_json(binary,PACKAGES)
-
-def runtime_hashes(prefix, kind):
-    prefix=Path(prefix)
-    files=[prefix/'bin'/name for name in binary_names(prefix)]
-    if kind=='raw':
-        files+=list((prefix/'lib').glob('python*/lib-dynload/*.so'))
-        for pattern in ('python*/tarfile.py','python*/ssl.py','python*/urllib/request.py'):
-            files+=list((prefix/'lib').glob(pattern))
-    return {str(p.relative_to(prefix)):hashlib.sha256(p.read_bytes()).hexdigest() for p in files if p.is_file()}
-
-def interpreter_images(prefix):
-    images={}
-    for name in binary_names(prefix):
-        p=Path(prefix)/'bin'/name
-        images[name]=dict(link=os.readlink(p)) if p.is_symlink() else dict(
-            data=p.read_bytes(),mode=stat.S_IMODE(p.stat().st_mode))
-    return images
-
-def publish_interpreters(prefix, images):
-    # Publish binary entries at their final paths and flush the binary directory.
-    bindir=Path(prefix)/'bin'
-    for name,spec in images.items():
-        tmp=bindir/(MARKER+uuid.uuid4().hex+'.interpreter')
-        try:
-            if 'link' in spec:tmp.symlink_to(spec['link'])
-            else:
-                with tmp.open('xb') as f:
-                    f.write(spec['data']);f.flush();os.fsync(f.fileno())
-                tmp.chmod(spec['mode'])
-            os.utime(tmp,None,follow_symlinks=False)
-            destination=bindir/name
-            # Remove the old entry before publishing and flushing its replacement.
-            if destination.exists() or destination.is_symlink():destination.unlink()
-            if 'link' in spec:
-                destination.symlink_to(spec['link'])
-                os.utime(destination,None,follow_symlinks=False)
-            else:
-                with destination.open('xb') as f:
-                    f.write(spec['data']);f.flush();os.fsync(f.fileno())
-                destination.chmod(spec['mode']);os.utime(destination,None)
-        finally:
-            if tmp.exists() or tmp.is_symlink():tmp.unlink()
-    fd=os.open(str(bindir),os.O_DIRECTORY)
-    try:os.fsync(fd)
-    finally:os.close(fd)
-
-def copy_into_existing(source, destination):
-    """Mirror a validated tree while retaining the live prefix directory inode.
-
-    Keep the prefix directory in place. Applications must be stopped because
-    publication spans multiple file operations.
-    """
-    source=Path(source);destination=Path(destination)
-    def remove(path):
-        if path.is_symlink() or not path.is_dir():path.unlink()
-        else:shutil.rmtree(path)
-    if source.is_symlink():
-        if destination.exists() or destination.is_symlink():remove(destination)
-        destination.symlink_to(os.readlink(source))
-        os.utime(destination,None,follow_symlinks=False)
-    elif source.is_dir():
-        if destination.is_symlink() or (destination.exists() and not destination.is_dir()):remove(destination)
-        destination.mkdir(exist_ok=True)
-        names={p.name for p in source.iterdir()}
-        for p in source.iterdir():copy_into_existing(p,destination/p.name)
-        for p in destination.iterdir():
-            if p.name not in names:remove(p)
-        shutil.copystat(source,destination,follow_symlinks=False)
-        os.utime(destination,None)
-    else:
-        tmp=destination.with_name(MARKER+uuid.uuid4().hex+'.file')
-        try:
-            shutil.copy2(source,tmp);os.utime(tmp,None)
-            if destination.is_symlink() or destination.is_dir():remove(destination)
-            os.replace(tmp,destination)
-        finally:
-            if tmp.exists():tmp.unlink()
-
-def validate(prefix, expected_version, expected_packages=None, checks=None, final=False, expected_scripts=None, expected_hashes=None):
-    prefix=Path(prefix); infos=[]
-    unresolved=unresolved_aliases(prefix,expected_version)
-    names=[name for name in binary_names(prefix) if name not in unresolved]
-    if not names: raise UpdateError('No Python executables in '+str(prefix))
-    for relative,expected in (expected_hashes or {}).items():
-        path=prefix/relative
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:
-            raise UpdateError('Runtime file integrity mismatch: '+str(path))
-    for name in names:
-        info=probe(prefix/'bin'/name)
-        if info['version']!=expected_version:
-            raise UpdateError('Interpreter alias has unexpected version: '+str(prefix/'bin'/name))
-        if info['prefix']!=canon(prefix):
-            raise UpdateError('Interpreter escaped environment: '+str(prefix/'bin'/name))
-        infos.append(info)
-    binary=str(prefix/'bin'/names[0])
-    core=run_json(binary,CORE_CHECK)
-    installed=packages(binary)
-    if expected_packages is not None and installed['packages']!=expected_packages:
-        raise UpdateError('Installed package inventory changed')
-    pip_check='pip absent'
-    if 'pip' in installed['packages']:
-        pip_check=run([binary,'-I','-m','pip','check']).strip()
-    results=[]
-    for check in checks or []:
-        if check.get('final_only') and not final:continue
-        argv=[s.replace('{python}',binary).replace('{prefix}',str(prefix)) for s in check['argv']]
-        output=run(argv,timeout=check.get('timeout',60),cwd=str(prefix))
-        if check.get('contains') and check['contains'] not in output:
-            raise UpdateError('Smoke check output mismatch: '+repr(argv))
-        results.append(dict(argv=argv,output=output[-2000:]))
-    # Entry points must survive publication at their existing paths.
-    if final:
-        missing=[n for n in (expected_scripts or []) if not (prefix/'bin'/n).is_file()]
-        if missing:raise UpdateError('Missing console scripts: '+repr(missing))
-    return dict(interpreters=infos,core=core,packages=installed,pip_check=pip_check,checks=results,
-                unresolved_aliases=[dict(path=str(prefix/'bin'/name),reason='Nonstandard alias has no usable ELF interpreter; intended version is unknown') for name in unresolved])
-
-def read_cfg(prefix):
-    result={}; p=Path(prefix)/'pyvenv.cfg'
-    if p.is_file():
-        for line in p.read_text().splitlines():
-            if '=' in line:
-                k,v=line.split('=',1); result[k.strip()]=v.strip()
-    return result
-
-def patch_venv(stage, target, original):
-    cfg=read_cfg(stage)
-    if not cfg: raise UpdateError('Legacy environment lacks pyvenv.cfg; migration requires a package rebuild')
-    unresolved=unresolved_aliases(stage,probe(target)['version'])
-    names=[name for name in binary_names(stage) if name not in unresolved]
-    for name in names:
-        p=stage/'bin'/name
-        if p.is_dir():raise UpdateError('Unexpected interpreter directory')
-        p.unlink()
-    args=[target,'-I','-m','venv','--upgrade','--without-pip','--copies',
-          '--prompt',cfg.get('prompt',Path(original).name).strip("'\"")]
-    if cfg.get('include-system-site-packages','false').lower()=='true': args.append('--system-site-packages')
-    run(args+[str(stage)],timeout=120)
-    for name in names:
-        p=stage/'bin'/name
-        if not p.exists():
-            shutil.copyfile(stage/'bin'/'python',p)
-            shutil.copymode(stage/'bin'/'python',p)
-    # Record installation time on aliases themselves, including repaired links.
-    # Do not follow links into another prefix when setting this metadata.
-    for name in binary_names(stage):
-        os.utime(stage/'bin'/name,None,follow_symlinks=False)
-    os.utime(stage/'pyvenv.cfg',None)
-    os.utime(stage/'bin',None)
-    os.utime(stage,None)
-
-def overlay_raw(stage, target_prefix, version):
-    target_prefix=Path(target_prefix); mm=branch(version)
-    def ignore(src,names):
-        result=[]
-        if Path(src).name=='bin':
-            result=[n for n in names if not PYNAME.fullmatch(n) and not re.fullmatch(r'python[0-9.]+-config',n)]
-        if Path(src).name=='python'+mm:
-            result += [n for n in names if n in ('site-packages','dist-packages')]
-        return result
-    # Target executables replace symlinks rather than writing through them.
-    for name in binary_names(target_prefix):
-        p=stage/'bin'/name
-        if p.exists() or p.is_symlink():p.unlink()
-    def copy_installed(src,dst):
-        result=shutil.copy2(src,dst)
-        # Installation timestamps invalidate stale file/cache views when a
-        # replacement was built before the current interpreter. This also
-        # forces source-based bytecode cache validation after an overlay.
-        os.utime(dst,None)
-        return result
-    shutil.copytree(str(target_prefix),str(stage),symlinks=True,dirs_exist_ok=True,ignore=ignore,
-                    copy_function=copy_installed)
-    # Relocate build metadata; package files and package entry points are preserved.
-    metadata=list((stage/'lib').glob('python*/_sysconfigdata_*.py'))
-    metadata+=list((stage/'lib').glob('python*/config-*/Makefile'))
-    metadata+=list((stage/'lib').glob('pkgconfig/python*.pc'))
-    metadata+=list((stage/'bin').glob('python*-config'))
-    return metadata
-
-def root_guard():
-    if hasattr(os,'geteuid') and os.geteuid()==0:
-        # A single root mapping identifies the disposable execution environment.
-        # Host root remains disallowed for probing arbitrary user-owned binaries.
-        try: mapping=Path('/proc/self/uid_map').read_text().split()
-        except OSError: mapping=[]
-        if mapping != ['0','0','1']:
-            raise UpdateError('Run as the owner of the private Python installations, without sudo')
-
-def protected(prefix):
-    p=Path(prefix).resolve()
-    return any(p==Path(root) or Path(root) in p.parents for root in ('/usr','/bin','/sbin','/lib','/lib64','/System','/opt/codex'))
-
-def checks_for(prefix, config):
-    checks=[]
-    for pattern,items in (config or {}).items():
-        if fnmatch.fnmatch(prefix,pattern): checks.extend(items)
-    return checks
-
-def load_targets(specs):
-    targets={}
-    for spec in specs:
-        mm,sep,path=spec.partition('=')
-        if not sep:raise UpdateError('Target format: 3.11=/absolute/path/bin/python3.11')
-        info=probe(path)
-        if branch(info['version'])!=mm:raise UpdateError('Cross-minor targets require an application migration')
-        if info['prefix']!=info['base_prefix']:raise UpdateError('Target must be a raw CPython installation')
-        floor=PATCH_FLOORS.get(mm)
-        if floor and version_tuple(info['version'])<version_tuple(floor):
-            raise UpdateError('Target is below the security policy floor '+floor)
-        targets[mm]=info
-    return targets
-
-def make_plan(inventory,targets):
-    plan=[]
-    for env in inventory['environments']:
-        item=dict(env); mm=branch(env['version']); target=targets.get(mm)
-        item['eol']=EOL.get(mm); item['target']=target
-        reason=None
-        if env.get('managed') in ('conda','conda-package-cache'):reason='Conda-managed prefix/cache: use the Conda solver'
-        elif protected(env['prefix']):reason='Distribution/runtime-managed prefix'
-        elif env.get('referenced_only'):reason='Referenced base lies outside the scanned trees; add its path as a root'
-        elif not target:reason='Target interpreter missing'
-        elif len({branch(v) for v in env['versions']})!=1:reason='Multiple minor branches share a prefix'
-        elif any(version_tuple(v)>version_tuple(target['version']) for v in env['versions']):reason='Downgrade refused'
-        elif all(v==target['version'] for v in env['versions']) and not [e for e in env.get('binary_errors',[]) if Path(e['path']).name not in env.get('unresolved_aliases',[])]:reason='up_to_date'
-        elif any(env[k]!=target[k] for k in ('soabi','machine','pointer_bits','shared')):reason='Interpreter ABI/build mismatch'
-        elif env['kind']=='raw' and env['shared']:reason='Shared-library raw build needs a prefix-specific rebuild'
-        elif canon(env['prefix']) in {canon(sys.prefix),canon(sys.base_prefix)}:reason='Running updater interpreter'
-        elif env['kind']=='raw' and within(target['prefix'],env['prefix']):reason='Target is nested inside source prefix'
-        elif not os.access(str(Path(env['prefix']).parent),os.W_OK):reason='Parent directory lacks write access'
-        item['action']='skip' if reason else 'update';item['reason']=reason
-        plan.append(item)
-    return sorted(plan,key=lambda e:(e['kind']!='raw',e['prefix']))
-
-def restore(entry,journal):
-    prefix=Path(entry['prefix']);backup=Path(entry['backup'])
-    if not backup.is_dir():raise UpdateError('Backup missing: '+str(backup))
-    if prefix.is_symlink():raise UpdateError('Rollback prefix changed to a symlink')
-    if prefix.exists() and entry.get('installed_identity'):
-        st=prefix.stat()
-        if [st.st_dev,st.st_ino]!=entry['installed_identity']:
-            raise UpdateError('Rollback prefix identity changed')
-    # Restore contents with a fresh installation time, keeping file modes and
-    # skipping links to other prefixes. This avoids stale timestamp-based views.
-    for root,dirs,files in os.walk(backup,followlinks=False):
-        for name in dirs+files:
-            p=Path(root)/name
-            if p.lstat().st_uid==os.geteuid():os.utime(p,None,follow_symlinks=False)
-    os.utime(backup,None)
-    images=interpreter_images(backup)
-    failed=prefix.with_name(prefix.name+MARKER+uuid.uuid4().hex+'.failed')
-    if entry.get('publication')=='files':
-        if prefix.exists():shutil.copytree(prefix,failed,symlinks=True)
-        copy_into_existing(backup,prefix)
-        publish_interpreters(prefix,images)
-        entry['status']='rolled_back';entry['rolled_back_at']=utcnow();entry['failed_copy']=str(failed)
-        atomic_json(journal['path'],journal)
-        return
-    if prefix.exists() or prefix.is_symlink():os.replace(prefix,failed)
-    try:os.replace(backup,prefix)
-    except BaseException:
-        if failed.exists():os.replace(failed,prefix)
-        raise
-    publish_interpreters(prefix,images)
-    entry['status']='rolled_back';entry['rolled_back_at']=utcnow();entry['failed_copy']=str(failed)
-    atomic_json(journal['path'],journal)
-
-def apply_plan(plan,journal_path,check_config,discovery_warnings=None):
-    journal_path=Path(journal_path).absolute()
-    if journal_path.exists():raise UpdateError('Journal exists; choose a new file or use rollback')
-    journal=dict(schema=1,created=utcnow(),policy_date='2026-11-01',path=str(journal_path),entries=[],complete=False,
-                 discovery_warnings=discovery_warnings or [],
-                 unresolved_aliases=[dict(prefix=p['prefix'],name=name,reason='Nonstandard alias has no usable interpreter; preserved for review') for p in plan for name in p.get('unresolved_aliases',[])],
-                 skipped=[dict(prefix=p['prefix'],reason=p['reason'],version=p['version']) for p in plan if p['action']=='skip'],
-                 end_of_support=[dict(prefix=p['prefix'],branch=branch(p['version']),ended=p['eol']) for p in plan if p.get('eol')])
-    atomic_json(journal_path,journal)
-    # Snapshot before raw updates: symlink-based venvs can observe a new Python
-    # as soon as their shared base changes.
-    snapshots={};journal['failed_snapshots']=[]
-    for item in plan:
-        if item['action']=='update':
-            try:snapshots[item['prefix']]=packages(item['binary'])
-            except UpdateError as e:
-                item['action']='skip';item['reason']='Snapshot failed: '+str(e)
-                journal['skipped'].append(dict(prefix=item['prefix'],reason=item['reason'],version=item['version']))
-                journal['failed_snapshots'].append(dict(prefix=item['prefix'],error=str(e)))
-    failures=len(journal['failed_snapshots'])
-    # Do not change the stdlib beneath a copied venv interpreter whose package
-    # inventory could not be read. Healthy peers can use the separate target.
-    blocked_bases={item['base_prefix'] for item in plan
-                   if item['kind']=='venv' and item['prefix'] in
-                   {f['prefix'] for f in journal['failed_snapshots']}}
-    for item in plan:
-        if item['kind']=='raw' and item['action']=='update' and item['prefix'] in blocked_bases:
-            item['action']='skip';item['reason']='Dependent environment snapshot failed; raw base left unchanged'
-            journal['skipped'].append(dict(prefix=item['prefix'],reason=item['reason'],version=item['version']))
-    for item in plan:
-        if item['action']!='update':
-            emit('skip',prefix=item['prefix'],reason=item['reason']);continue
-        prefix=Path(item['prefix']);target=item['target'];token=uuid.uuid4().hex
-        stage=prefix.with_name(prefix.name+MARKER+token+'.stage')
-        backup=prefix.with_name(prefix.name+MARKER+token+'.backup')
-        entry=dict(prefix=str(prefix),stage=str(stage),backup=str(backup),kind=item['kind'],
-                   old_version=item['version'],target_version=target['version'],
-                   packages=snapshots[str(prefix)]['packages'],
-                   console_scripts=snapshots[str(prefix)]['present_console_scripts'],
-                   status='preparing',eol=item['eol'],publication='files')
-        journal['entries'].append(entry);atomic_json(journal_path,journal)
-        try:
-            if prefix.is_symlink():raise UpdateError('Canonical prefix changed to a symlink during update')
-            st=prefix.stat();entry['original_identity']=[st.st_dev,st.st_ino]
-            if st.st_uid!=os.geteuid():raise UpdateError('Prefix is owned by another user')
-            emit('prepare',prefix=str(prefix),target=target['version'])
-            shutil.copytree(prefix,stage,symlinks=True)
-            if item['kind']=='venv':
-                base=item['base_prefix'];base_target=target['binary']
-                # Prefer an updated existing raw prefix, preserving base-package
-                # visibility for system-site-packages environments.
-                candidate=Path(base)/'bin'/('python'+branch(target['version']))
-                try:
-                    if probe(candidate)['version']==target['version']:base_target=str(candidate)
-                except UpdateError:pass
-                patch_venv(stage,base_target,str(prefix))
-            else:
-                metadata=overlay_raw(stage,target['prefix'],target['version'])
-                for path in metadata:
-                    if path.is_symlink():continue
-                    data=path.read_text()
-                    path.write_text(data.replace(target['prefix'],str(prefix)))
-            checks=checks_for(str(prefix),check_config)
-            entry['staged_validation']=validate(stage,target['version'],entry['packages'],checks)
-            entry['runtime_hashes']=runtime_hashes(stage,item['kind'])
-            images=interpreter_images(stage)
-            current=prefix.stat()
-            if [current.st_dev,current.st_ino]!=entry['original_identity']:
-                raise UpdateError('Prefix identity changed during staging')
-            entry['status']='prepared';atomic_json(journal_path,journal)
-            shutil.copytree(prefix,backup,symlinks=True)
-            entry['status']='backed_up';atomic_json(journal_path,journal)
-            copy_into_existing(stage,prefix)
-            installed_stat=prefix.stat();entry['installed_identity']=[installed_stat.st_dev,installed_stat.st_ino]
-            entry['status']='installed';atomic_json(journal_path,journal)
-            publish_interpreters(prefix,images)
-            entry['validation']=validate(prefix,target['version'],entry['packages'],checks,final=True,
-                                         expected_scripts=entry['console_scripts'],expected_hashes=entry['runtime_hashes'])
-            entry['status']='verified';entry['finished']=utcnow();atomic_json(journal_path,journal)
-            emit('verified',prefix=str(prefix),version=target['version'],packages=len(entry['packages']))
-            shutil.rmtree(stage)
-        except BaseException as e:
-            entry['error']=str(e);failures+=1
-            if backup.is_dir():restore(entry,journal)
-            else:entry['status']='failed_before_swap';atomic_json(journal_path,journal)
-            emit('failed',prefix=str(prefix),reason=str(e),status=entry['status'])
-            if isinstance(e,(KeyboardInterrupt,SystemExit)):raise
-    # Recheck the complete batch after shared raw bases and dependent venvs have
-    # finished; a per-prefix success cannot establish the final batch state.
-    for entry in journal['entries']:
-        if entry['status']!='verified':continue
-        try:
-            validate(entry['prefix'],entry['target_version'],entry['packages'],
-                     checks_for(entry['prefix'],check_config),True,entry['console_scripts'],entry['runtime_hashes'])
-            entry['batch_rechecked']=utcnow()
-        except UpdateError as e:
-            entry['status']='batch_recheck_failed';entry['error']=str(e);failures+=1
-            emit('batch_recheck_failed',prefix=entry['prefix'],reason=str(e))
-    journal['complete']=True;journal['finished']=utcnow();journal['failures']=failures
-    atomic_json(journal_path,journal)
-    return journal
-
-def main():
-    os.umask(0o077)
-    parser=argparse.ArgumentParser(prog='update_python_envs.sh',description=__doc__)
-    sub=parser.add_subparsers(dest='command',required=True)
-    for name in ('scan','plan','apply'):
-        p=sub.add_parser(name)
-        p.add_argument('roots',nargs='+',help='Trusted private directories; directory links are followed')
-        p.add_argument('--exclude',action='append',default=[])
-        p.add_argument('--output',required=True,help='Inventory/plan JSON or apply journal')
-        if name!='scan':
-            p.add_argument('--target',action='append',required=True,help='MINOR=/path/to/patched/raw/bin/python')
-        if name=='apply':p.add_argument('--checks',help='JSON: path glob -> argv smoke checks')
-    p=sub.add_parser('verify');p.add_argument('journal');p.add_argument('--checks');p.add_argument('--output',required=True)
-    p=sub.add_parser('rollback');p.add_argument('journal')
-    args=parser.parse_args();root_guard()
-    if args.command=='apply' and os.environ.get('PY_ENV_UPDATE_POST_VERIFY')=='1':
-        args.command='verify';args.journal=args.output
-        args.output=args.journal+'.post-verify.json'
-    if args.command in ('scan','plan','apply'):
-        excluded=list(args.exclude)
-        targets=load_targets(args.target) if args.command!='scan' else {}
-        excluded.extend(t['prefix'] for t in targets.values())
-        inventory=scan(args.roots,excluded)
-        if args.command=='scan':
-            atomic_json(args.output,inventory)
-            emit('scanned',environments=len(inventory['environments']),warnings=len(inventory['warnings']))
-            return 0
-        plan=make_plan(inventory,targets)
-        if args.command=='plan':
-            atomic_json(args.output,dict(inventory=inventory,plan=plan))
-            emit('planned',updates=sum(p['action']=='update' for p in plan),skips=sum(p['action']=='skip' for p in plan))
-            return 0
-        checks=json.loads(Path(args.checks).read_text()) if args.checks else {}
-        # A per-parent flock prevents simultaneous updater instances touching the
-        # same prefixes, even when journal paths differ.
-        locks=[]
-        try:
-            for parent in sorted({str(Path(p['prefix']).parent) for p in plan if p['action']=='update'}):
-                f=open(Path(parent)/(MARKER+'lock'),'a')
-                try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                except BlockingIOError:raise UpdateError('Another updater holds '+parent)
-                locks.append(f)
-            journal=apply_plan(plan,args.output,checks,inventory['warnings'])
-            return 1 if journal['failures'] else 0
-        finally:
-            for f in locks:f.close()
-    journal=json.loads(Path(args.journal).read_text())
-    if args.command=='rollback':
-        journal['path']=str(Path(args.journal).absolute())
-        # Reverse order restores venvs before their raw bases.
-        for entry in reversed(journal['entries']):
-            if entry['status'] in ('verified','installed','backed_up','prepared','batch_recheck_failed') and Path(entry['backup']).is_dir():
-                restore(entry,journal);emit('rolled_back',prefix=entry['prefix'])
-        return 0
-    checks=json.loads(Path(args.checks).read_text()) if args.checks else {}
-    results=[dict(prefix=f['prefix'],passed=False,error='Snapshot failed: '+f['error'])
-             for f in journal.get('failed_snapshots',[])]
-    for entry in journal['entries']:
-        if entry['status']!='verified':
-            results.append(dict(prefix=entry['prefix'],passed=False,error='Update status: '+entry['status']))
-            continue
-        try:
-            result=validate(entry['prefix'],entry['target_version'],entry['packages'],checks_for(entry['prefix'],checks),True,
-                            expected_scripts=entry.get('console_scripts',[]),expected_hashes=entry.get('runtime_hashes',{}))
-            results.append(dict(prefix=entry['prefix'],passed=True,validation=result))
-        except UpdateError as e:results.append(dict(prefix=entry['prefix'],passed=False,error=str(e)))
-    atomic_json(args.output,dict(created=utcnow(),results=results))
-    emit('verification',passed=sum(r['passed'] for r in results),failed=sum(not r['passed'] for r in results),
-         unresolved_aliases=sum(len(r.get('validation',{}).get('unresolved_aliases',[])) for r in results))
-    return 0 if all(r['passed'] for r in results) else 1
-
-if __name__=='__main__':
-    try:sys.exit(main())
-    except UpdateError as e:emit('error',reason=str(e));sys.exit(2)
-
-PY_ENV_UPDATE_ENGINE
+Options: --exclude PATH (repeatable), --checks checks.json (apply/verify).
+Discovery follows directory links and probes actual ELF interpreter binaries.
+All control flow, discovery, JSON, copying, validation, and recovery use Bash and
+Unix utilities. Python is invoked through existing version/module commands.
+Stop applications before apply or rollback. Use trusted private installation roots.
+HELP
+}
+require_tools() {
+  local tool
+  [[ ${BASH_VERSINFO[0]} -ge 4 ]] || die 'Bash 4 or newer is required'
+  for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od; do
+    command -v "$tool" >/dev/null || die "Required utility missing: $tool"
+  done
+}
+root_guard() {
+  if [[ $EUID -eq 0 ]]; then
+    local mapping=''
+    [[ ! -r /proc/self/uid_map ]] || mapping="$(awk '{$1=$1;print}' /proc/self/uid_map)"
+    [[ $mapping == '0 0 1' ]] || die 'Run as the installation owner, without sudo'
+  fi
+}
+safe_path() { [[ $1 != *$'\n'* && $1 != *$'\r'* && $1 != *$'\t'* ]] || die 'Paths containing tabs or line breaks are unsupported'; }
+absolute() {
+  safe_path "$1"
+  realpath -ms -- "$1"
+}
+canonical() {
+  safe_path "$1"
+  realpath -e -- "$1"
+}
+within() { [[ $1 == "$2" || $1 == "$2/"* ]]; }
+stable_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+minor() { printf '%s\n' "${1%.*}"; }
+is_python_name() { [[ $1 =~ ^python([0-9]+(\.[0-9]+)*)?$ ]]; }
+is_standard() { [[ $1 == python || $1 == python3 || $1 == "python$2" ]]; }
+is_elf() {
+  [[ -f $1 && -x $1 ]] || return 1
+  [[ $(od -An -N4 -tx1 -- "$1" 2>/dev/null | tr -d ' \n') == 7f454c46 ]]
+}
+runpy() {
+  local name
+  local -a environment=(env -u VIRTUAL_ENV -u CONDA_PREFIX)
+  for name in ${!PYTHON@}; do environment+=(-u "$name"); done
+  timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@"
+}
+config_value() {
+  awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= \"/, "");sub(/\"$/, "");print;exit}' "$1"
+}
+# The sysconfig module CLI supplies identity and ABI without inline code.
+probe() {
+  local binary version report prefix base abi shared bits pure plat machine configured managed='private'
+  binary="$(absolute "$1")"
+  is_elf "$binary" || return 1
+  version="$(PY_TIMEOUT=45 runpy "$binary" -I --version 2>/dev/null)" || return 1
+  version=${version#Python }
+  stable_version "$version" || return 1
+  report="$(mktemp "$WORK/sysconfig.XXXXXX")"
+  if ! PY_TIMEOUT=45 runpy "$binary" -I -m sysconfig >"$report" 2>/dev/null; then
+    rm -f -- "$report"
+    return 1
+  fi
+  prefix="$(config_value "$report" base)"
+  base="$(config_value "$report" installed_base)"
+  configured="$(config_value "$report" prefix)"
+  abi="$(config_value "$report" SOABI)"
+  shared="$(config_value "$report" Py_ENABLE_SHARED)"
+  bits="$(config_value "$report" SIZEOF_VOID_P)"
+  pure="$(config_value "$report" purelib)"
+  plat="$(config_value "$report" platlib)"
+  machine="$(awk '/^Platform:/ {sub(/^Platform: \"/, "");sub(/\"$/, "");print;exit}' "$report")"
+  rm -f -- "$report"
+  [[ $prefix == /* && $base == /* && $abi == cpython-* && $bits =~ ^[0-9]+$ && $shared =~ ^[01]$ ]] || return 1
+  prefix="$(canonical "$prefix")"
+  base="$(canonical "$base")"
+  if [[ -d $prefix/conda-meta ]]; then
+    managed=conda
+  elif [[ -f $prefix/info/index.json ]] && jq -e '.name=="python"' "$prefix/info/index.json" >/dev/null 2>&1; then managed=conda-package-cache; fi
+  jq -cn --arg binary "$binary" --arg resolved "$(canonical "$binary")" --arg version "$version" \
+    --arg prefix "$prefix" --arg base "$base" --arg soabi "$abi" --argjson shared "$shared" \
+    --argjson bytes "$bits" --arg machine "$machine" --arg managed "$managed" --arg purelib "$pure" --arg platlib "$plat" --arg configured_prefix "$configured" \
+    '{binary:$binary,resolved:$resolved,version:$version,prefix:$prefix,base_prefix:$base,soabi:$soabi,
+      shared:$shared,pointer_bits:($bytes*8),machine:$machine,managed:$managed,purelib:$purelib,platlib:$platlib,configured_prefix:$configured_prefix,
+      kind:(if $prefix==$base then "raw" else "venv" end)}'
+}
+atomic_write() {
+  local destination=$1 temp
+  mkdir -p -- "$(dirname -- "$destination")"
+  temp="$(mktemp "${destination}.tmp.XXXXXX")"
+  cat >"$temp"
+  sync -d "$temp"
+  mv -f -- "$temp" "$destination"
+  sync -f "$(dirname -- "$destination")"
+}
+json_edit() {
+  local destination=$1 temp
+  shift
+  temp="$(mktemp "$WORK/json.XXXXXX")"
+  jq "$@" "$destination" >"$temp"
+  atomic_write "$destination" <"$temp"
+  rm -f -- "$temp"
+}
+event() { jq -cn --arg event "$1" --arg prefix "${2:-}" --arg detail "${3:-}" '{event:$event,prefix:$prefix,detail:$detail}'; }
+warning() { jq -cn --arg path "$1" --arg reason "$2" '{path:$path,reason:$reason}' >>"$WORK/warnings.ndjson"; }
+scan() {
+  local destination=$1 root path name info base mm bin exclude line prefix skip status=0
+  local -a find_roots=() canonical_excludes=() expression=('(' -name "*$MARKER*" -prune)
+  local -A seen=() prefixes=()
+  : >"$WORK/candidates"
+  : >"$WORK/probes.ndjson"
+  : >"$WORK/warnings.ndjson"
+  : >"$WORK/links.ndjson"
+  for exclude in "${EXCLUDES[@]}"; do
+    canonical_excludes+=("$(realpath -m -- "$exclude")")
+    expression+=(-o -path "$(absolute "$exclude")" -prune -o -path "${canonical_excludes[-1]}" -prune)
+  done
+  expression+=(')' -o '(' -name pyvenv.cfg -o -path '*/bin/python*' -o -xtype l ')' -print0)
+  for root in "${ROOTS[@]}"; do
+    root="$(absolute "$root")"
+    if [[ -e $root || -L $root ]]; then find_roots+=("$root"); else warning "$root" 'Missing search root'; fi
+    [[ ! -f $root ]] || printf '%s\0' "$root" >>"$WORK/candidates"
+  done
+  if ((${#find_roots[@]})); then
+    find -L "${find_roots[@]}" "${expression[@]}" >"$WORK/found" 2>"$WORK/find-errors" || status=$?
+    while IFS= read -r line; do warning '' "$line"; done <"$WORK/find-errors"
+    while IFS= read -r -d '' path; do
+      safe_path "$path"
+      if [[ -L $path ]]; then
+        jq -cn --arg path "$path" --arg target "$(realpath -m -- "$path")" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
+        [[ -e $path ]] || warning "$path" 'Broken link'
+      fi
+      name=${path##*/}
+      if [[ $name == pyvenv.cfg && -f $path ]]; then
+        bin=${path%/*}/bin
+        if [[ -d $bin ]]; then
+          find "$bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0 >>"$WORK/candidates"
+        else warning "${path%/*}" 'pyvenv.cfg has no bin directory'; fi
+      elif is_python_name "$name"; then printf '%s\0' "$path" >>"$WORK/candidates"; fi
+    done <"$WORK/found"
+  fi
+  while IFS= read -r -d '' path; do
+    name=${path##*/}
+    is_python_name "$name" || continue
+    [[ ! ${seen[$path]+yes} ]] || continue
+    seen[$path]=1
+    if info="$(probe "$path")"; then
+      prefix="$(jq -r .prefix <<<"$info")"
+      skip=0
+      for exclude in "${canonical_excludes[@]}"; do
+        if within "$prefix" "$exclude"; then
+          skip=1
+          break
+        fi
+      done
+      ((skip == 0)) || continue
+      printf '%s\n' "$info" >>"$WORK/probes.ndjson"
+      prefixes[$prefix]=1
+    else warning "$path" 'Missing, non-ELF, or unusable CPython interpreter'; fi
+  done <"$WORK/candidates"
+  cp -- "$WORK/probes.ndjson" "$WORK/references.ndjson"
+  while IFS= read -r info; do
+    [[ $(jq -r .kind <<<"$info") == venv ]] || continue
+    base="$(jq -r .base_prefix <<<"$info")"
+    [[ ! ${prefixes[$base]+yes} ]] || continue
+    mm="$(minor "$(jq -r .version <<<"$info")")"
+    if info="$(probe "$base/bin/python$mm")"; then
+      jq -c '.+{referenced_only:true}' <<<"$info" >>"$WORK/probes.ndjson"
+      prefixes[$base]=1
+    else warning "$base" 'Referenced raw base has no usable versioned binary'; fi
+  done <"$WORK/references.ndjson"
+  jq -s 'group_by(.prefix)|map(.[0] as $first|$first+{aliases:(map(.binary)|unique),
+    binaries:map({path:.binary,version:.version,resolved:.resolved}),versions:(map(.version)|unique)})|sort_by(.prefix)' "$WORK/probes.ndjson" >"$WORK/environments.json"
+  jq -n --arg created "$(now)" --argjson walk_status "$status" --slurpfile environments "$WORK/environments.json" \
+    --slurpfile warnings "$WORK/warnings.ndjson" --slurpfile links "$WORK/links.ndjson" \
+    '{created:$created,engine:"bash",walk_status:$walk_status,environments:$environments[0],warnings:$warnings,symlinks:$links}' | atomic_write "$destination"
+}
+load_targets() {
+  local spec mm path info version prefix floor
+  : >"$WORK/targets.ndjson"
+  for spec in "${TARGET_SPECS[@]}"; do
+    [[ $spec == *=* ]] || die 'Target syntax: MINOR=/absolute/path/bin/python'
+    mm=${spec%%=*}
+    path=${spec#*=}
+    [[ ${FLOORS[$mm]+yes} ]] || die "No tested release policy for Python $mm"
+    info="$(probe "$path")" || die "Target is not a working CPython ELF interpreter: $path"
+    version="$(jq -r .version <<<"$info")"
+    prefix="$(jq -r .prefix <<<"$info")"
+    floor=${FLOORS[$mm]}
+    [[ $(minor "$version") == "$mm" ]] || die 'Cross-minor target refused'
+    [[ $(jq -r .kind <<<"$info") == raw ]] || die 'Target must be a raw installation'
+    ((10#${version##*.} >= 10#${floor##*.})) || die "Target is below policy floor $floor"
+    [[ $(jq -r .managed <<<"$info") == private ]] || die 'Conda cannot serve as a raw CPython patch target'
+    jq -c --arg minor "$mm" '.+{minor:$minor}' <<<"$info" >>"$WORK/targets.ndjson"
+    EXCLUDES+=("$prefix")
+  done
+  jq -s 'if ([.[].minor]|length)!=([.[].minor]|unique|length) then error("Duplicate target branch") else map({key:.minor,value:.})|from_entries end' "$WORK/targets.ndjson" >"$WORK/targets.json"
+}
+protected() {
+  local root
+  for root in /usr /bin /sbin /lib /lib64 /System /opt/codex; do within "$1" "$root" && return 0; done
+  return 1
+}
+make_plan() {
+  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch
+  : >"$WORK/plan.ndjson"
+  while IFS= read -r item; do
+    prefix="$(jq -r .prefix <<<"$item")"
+    kind="$(jq -r .kind <<<"$item")"
+    version="$(jq -r .version <<<"$item")"
+    mm=$(minor "$version")
+    target="$(jq -c --arg mm "$mm" '.[$mm]//null' "$WORK/targets.json")"
+    reason=''
+    unresolved='[]'
+    flag=0
+    while IFS= read -r -d '' candidate; do
+      name=${candidate##*/}
+      is_python_name "$name" || continue
+      if ! is_elf "$candidate"; then
+        if is_standard "$name" "$mm"; then flag=1; else unresolved="$(jq -c --arg name "$name" '.+[$name]' <<<"$unresolved")"; fi
+      fi
+    done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
+    if [[ $(jq -r .managed <<<"$item") != private ]]; then
+      reason='Conda-managed prefix/cache: use the Conda solver'
+    elif protected "$prefix"; then
+      reason='Distribution/runtime-managed prefix'
+    elif [[ -L $prefix/bin || -L $prefix/lib ]]; then
+      reason='Linked bin/lib subdirectories require a separate rebuild'
+    elif [[ $(jq -r '.referenced_only//false' <<<"$item") == true ]]; then
+      reason='Referenced raw base outside searched trees; add it as a root'
+    elif [[ $target == null ]]; then
+      reason='Target interpreter missing'
+    elif [[ $(jq '[.versions[]|split(".")[0:2]|join(".")]|unique|length' <<<"$item") != 1 ]]; then
+      reason='Multiple minor branches share a prefix'
+    elif [[ $(jq -c '[.soabi,.shared,.pointer_bits,.machine]' <<<"$item") != "$(jq -c '[.soabi,.shared,.pointer_bits,.machine]' <<<"$target")" ]]; then
+      reason='Interpreter ABI/build mismatch'
+    else
+      newer=0
+      patch="$(jq -r '.version|split(".")[-1]' <<<"$target")"
+      while IFS= read -r candidate; do ((10#${candidate##*.} <= 10#$patch)) || newer=1; done < <(jq -r '.versions[]' <<<"$item")
+      if ((newer)); then
+        reason='Downgrade refused'
+      elif [[ $(jq -c .versions <<<"$item") == "$(jq -c '[.version]' <<<"$target")" && $flag == 0 ]]; then
+        reason=up_to_date
+      elif [[ $kind == raw && $(jq -r .shared <<<"$item") != 0 ]]; then
+        reason='Shared raw build requires a prefix-specific rebuild'
+      elif [[ $kind == raw ]] && within "$(jq -r .prefix <<<"$target")" "$prefix"; then
+        reason='Target is inside the source prefix'
+      elif [[ $(stat -Lc %u -- "$prefix") != "$EUID" || ! -w $(dirname -- "$prefix") ]]; then reason='Prefix ownership or parent write access does not permit updating'; fi
+    fi
+    jq -c --arg reason "$reason" --arg eol "${EOL[$mm]:-}" --argjson target "$target" --argjson unresolved "$unresolved" \
+      '.+{target:$target,eol:$eol,unresolved_aliases:$unresolved,action:(if $reason=="" then "update" else "skip" end),reason:$reason}' <<<"$item" >>"$WORK/plan.ndjson"
+  done < <(jq -c '.environments[]' "$inventory")
+  jq -n --slurpfile inventory "$inventory" --slurpfile plan "$WORK/plan.ndjson" \
+    '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
 }
 
-# A fresh process checks the persisted state after the updating process exits.
-# This also catches stale interpreter/link views outside that process.
-if PY_ENV_UPDATE_POST_VERIFY=0 run_engine "$@"; then
-  if [[ "${1:-}" == "apply" ]]; then
-    PY_ENV_UPDATE_POST_VERIFY=1 run_engine "$@"
+# Read installed distribution records with awk/jq, including inherited packages.
+packages() {
+  local prefix=$1 destination=$2 info site scope metadata name version path metadata_file base mm index
+  local -a sites=() scopes=()
+  local -A seen_sites=()
+  info="$(probe "$(choose_binary "$prefix")")" || return 1
+  base="$(jq -r .base_prefix <<<"$info")"
+  mm="$(minor "$(jq -r .version <<<"$info")")"
+  sites+=("$prefix/lib/python$mm/site-packages" "$prefix/lib64/python$mm/site-packages" "$prefix/lib/python$mm/dist-packages")
+  scopes+=(local local local)
+  if [[ $base != "$prefix" && -f $prefix/pyvenv.cfg ]] && awk -F= '$1~/^include-system-site-packages *$/ && $2~/true/ {found=1} END{exit !found}' "$prefix/pyvenv.cfg"; then
+    sites+=("$base/lib/python$mm/site-packages" "$base/lib64/python$mm/site-packages" "$base/lib/python$mm/dist-packages")
+    scopes+=(base base base)
   fi
-else
-  exit "$?"
-fi
+  : >"$WORK/packages.ndjson"
+  : >"$WORK/empty-metadata.ndjson"
+  for index in "${!sites[@]}"; do
+    site=${sites[$index]}
+    scope=${scopes[$index]}
+    [[ -d $site ]] || continue
+    site="$(canonical "$site")"
+    [[ ! ${seen_sites[$site]+yes} ]] || continue
+    seen_sites[$site]=1
+    while IFS= read -r -d '' metadata; do
+      if [[ -d $metadata ]]; then
+        metadata_file=$metadata/METADATA
+        [[ -f $metadata_file ]] || metadata_file=$metadata/PKG-INFO
+      else metadata_file=$metadata; fi
+      if [[ ! -f $metadata_file ]]; then
+        path="$(find -P "$metadata" \( -type f -o -type l \) -print -quit)"
+        if [[ -z $path ]]; then
+          jq -cn --arg path "$metadata" '{path:$path}' >>"$WORK/empty-metadata.ndjson"
+          continue
+        fi
+        printf 'Incomplete distribution metadata: %s\n' "$metadata" >&2
+        return 1
+      fi
+      name="$(awk '/^Name: / {sub(/^Name: /, "");sub(/\r$/, "");print;exit}' "$metadata_file")"
+      version="$(awk '/^Version: / {sub(/^Version: /, "");sub(/\r$/, "");print;exit}' "$metadata_file")"
+      [[ -n $name && -n $version ]] || {
+        printf 'Incomplete distribution metadata: %s\n' "$metadata" >&2
+        return 1
+      }
+      jq -cn --arg name "$name" --arg version "$version" --arg scope "$scope" \
+        '{name:($name|ascii_downcase|gsub("[-_.]+";"-")),version:$version,scope:$scope}' >>"$WORK/packages.ndjson"
+    done < <(find "$site" -mindepth 1 -maxdepth 1 \( -name '*.dist-info' -o -name '*.egg-info' \) -print0)
+  done
+  jq -n --slurpfile packages "$WORK/packages.ndjson" --slurpfile ignored "$WORK/empty-metadata.ndjson" \
+    '{packages:($packages|sort_by(.scope,.name,.version)),ignored_empty_metadata:$ignored}' >"$destination"
+}
+choose_binary() {
+  local prefix=$1 path name
+  for name in python python3; do is_elf "$prefix/bin/$name" && {
+    printf '%s\n' "$prefix/bin/$name"
+    return
+  }; done
+  while IFS= read -r -d '' path; do
+    name=${path##*/}
+    is_python_name "$name" || continue
+    is_elf "$path" && {
+      printf '%s\n' "$path"
+      return
+    }
+  done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
+  return 1
+}
+hashes() {
+  local prefix=$1 kind=$2 destination=$3 path relative hash name
+  : >"$WORK/hashes.ndjson"
+  while IFS= read -r -d '' path; do
+    name=${path##*/}
+    if [[ $path == "$prefix/bin/"* ]]; then is_python_name "$name" || continue; fi
+    [[ -f $path ]] || continue
+    hash="$(sha256sum -- "$path")"
+    hash=${hash%% *}
+    relative=${path#"$prefix/"}
+    jq -cn --arg path "$relative" --arg sha256 "$hash" '{path:$path,sha256:$sha256}' >>"$WORK/hashes.ndjson"
+  done < <(
+    find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0
+    if [[ $kind == raw ]]; then find "$prefix/lib" -type f \( -path '*/lib-dynload/*.so' -o -path '*/python*/tarfile.py' -o -path '*/python*/ssl.py' -o -path '*/python*/urllib/request.py' \) -print0; fi
+  )
+  jq -s 'sort_by(.path)' "$WORK/hashes.ndjson" >"$destination"
+}
+check_hashes() {
+  local prefix=$1 manifest=$2 record path expected actual
+  while IFS= read -r record; do
+    path="$(jq -r .path <<<"$record")"
+    expected="$(jq -r .sha256 <<<"$record")"
+    [[ -f $prefix/$path ]] || {
+      printf 'Missing runtime file: %s\n' "$prefix/$path" >&2
+      return 1
+    }
+    actual="$(sha256sum -- "$prefix/$path")"
+    actual=${actual%% *}
+    [[ $actual == "$expected" ]] || {
+      printf 'Runtime integrity mismatch: %s\n' "$prefix/$path" >&2
+      return 1
+    }
+  done < <(jq -c '.[]' "$manifest")
+}
+application_checks() {
+  local prefix=$1 logical=$2 binary=$3 phase=$4 config=$5 pattern check argument output seconds
+  local -a argv=()
+  [[ -n $config ]] || return 0
+  while IFS= read -r pattern; do
+    [[ $logical == $pattern ]] || continue
+    while IFS= read -r check; do
+      [[ $phase == final || $(jq -r '.final_only//false' <<<"$check") != true ]] || continue
+      argv=()
+      while IFS= read -r -d '' argument; do
+        argument=${argument//\{python\}/$binary}
+        argument=${argument//\{prefix\}/$prefix}
+        argv+=("$argument")
+      done < <(jq -j '.argv[]|.,"\u0000"' <<<"$check")
+      ((${#argv[@]})) || return 1
+      seconds="$(jq -r '.timeout//120' <<<"$check")"
+      [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+      output="$(cd "$prefix" && timeout --kill-after=5 "$seconds" "${argv[@]}" 2>&1)" || {
+        printf '%s\n' "$output" >&2
+        return 1
+      }
+      if [[ $(jq -r '.contains//""' <<<"$check") != '' ]]; then [[ $output == *"$(jq -r .contains <<<"$check")"* ]] || return 1; fi
+    done < <(jq -c --arg pattern "$pattern" '.[$pattern][]' "$config")
+  done < <(jq -r 'keys[]' "$config")
+}
+validate() {
+  local prefix=$1 expected=$2 package_file=$3 manifest=$4 logical=$5 phase=$6 checks=$7 destination=$8
+  local path name info binary mm actual core count=0 unresolved='[]' pip_status='pip absent'
+  mm=$(minor "$expected")
+  : >"$WORK/validated.ndjson"
+  [[ -z $manifest ]] || check_hashes "$prefix" "$manifest" || return 1
+  while IFS= read -r -d '' path; do
+    name=${path##*/}
+    is_python_name "$name" || continue
+    if ! is_elf "$path" && ! is_standard "$name" "$mm"; then
+      unresolved="$(jq -c --arg path "$path" '.+[$path]' <<<"$unresolved")"
+      continue
+    fi
+    info="$(probe "$path")" || {
+      printf 'Interpreter failed: %s\n' "$path" >&2
+      return 1
+    }
+    [[ $(jq -r .version <<<"$info") == "$expected" && $(jq -r .prefix <<<"$info") == "$(canonical "$prefix")" ]] || {
+      printf 'Wrong version/prefix: %s\n' "$path" >&2
+      return 1
+    }
+    printf '%s\n' "$info" >>"$WORK/validated.ndjson"
+    count=$((count + 1))
+  done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
+  ((count > 0)) || return 1
+  binary="$(choose_binary "$prefix")" || return 1
+  actual="$(mktemp "$WORK/actual-packages.XXXXXX")"
+  packages "$prefix" "$actual" || return 1
+  [[ $(jq -c .packages "$package_file") == "$(jq -c .packages "$actual")" ]] || {
+    printf 'Installed package inventory changed: %s\n' "$prefix" >&2
+    return 1
+  }
+  if jq -e '.packages[]|select(.name=="pip")' "$actual" >/dev/null; then
+    pip_status="$(runpy "$binary" -I -m pip check 2>&1)" || {
+      printf '%s\n' "$pip_status" >&2
+      return 1
+    }
+  fi
+  core="$(mktemp -d "$WORK/core.XXXXXX")"
+  (cd "$core" && runpy "$binary" -I -m pydoc -w ssl sqlite3 bz2 lzma ctypes venv >"$core/imports.log" 2>&1) || {
+    printf 'Core module check failed for %s:\n' "$binary" >&2
+    cat "$core/imports.log" >&2
+    return 1
+  }
+  for name in ssl sqlite3 bz2 lzma ctypes venv; do [[ -s $core/$name.html ]] || {
+    printf 'Core module failed to load: %s\n' "$name" >&2
+    return 1
+  }; done
+  application_checks "$prefix" "$logical" "$binary" "$phase" "$checks" || return 1
+  jq -n --slurpfile interpreters "$WORK/validated.ndjson" --slurpfile packages "$actual" --arg pip_check "$pip_status" --argjson unresolved "$unresolved" \
+    '{interpreters:$interpreters,packages:$packages[0],pip_check:$pip_check,unresolved_aliases:$unresolved,core_modules:["ssl","sqlite3","bz2","lzma","ctypes","venv"]}' >"$destination"
+}
+replace_literal() {
+  local file=$1 old=$2 new=$3 temp
+  [[ -f $file && ! -L $file ]] || return 0
+  temp="$(mktemp "${file}.rewrite.XXXXXX")"
+  OLD_PREFIX=$old NEW_PREFIX=$new awk 'BEGIN{old=ENVIRON["OLD_PREFIX"];new=ENVIRON["NEW_PREFIX"]}
+    {s=$0;out="";while((n=index(s,old))>0){out=out substr(s,1,n-1) new;s=substr(s,n+length(old))}print out s}' "$file" >"$temp"
+  chmod --reference="$file" "$temp"
+  mv -f -- "$temp" "$file"
+}
+patch_stage() {
+  local entry=$1 stage prefix kind target target_prefix version mm path name base candidate info
+  local -a names=() options=()
+  stage="$(jq -r .stage "$entry")"
+  prefix="$(jq -r .prefix "$entry")"
+  kind="$(jq -r .kind "$entry")"
+  target="$(jq -r .target.binary "$entry")"
+  target_prefix="$(jq -r .target.prefix "$entry")"
+  version="$(jq -r .target.version "$entry")"
+  mm=$(minor "$version")
+  if [[ $kind == venv ]]; then
+    [[ -f $stage/pyvenv.cfg ]] || die 'Legacy venv has no pyvenv.cfg; rebuild required'
+    while IFS= read -r -d '' path; do
+      name=${path##*/}
+      is_python_name "$name" || continue
+      if is_elf "$path" || is_standard "$name" "$mm"; then
+        names+=("$name")
+        rm -f -- "$path"
+      fi
+    done < <(find "$stage/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
+    base="$(jq -r .base_prefix "$entry")"
+    candidate=$base/bin/python$mm
+    if info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
+    if awk -F= '$1~/^include-system-site-packages *$/ && $2~/true/ {found=1} END{exit !found}' "$stage/pyvenv.cfg"; then options+=(--system-site-packages); fi
+    runpy "$target" -I -m venv --upgrade --without-pip --copies "${options[@]}" "$stage"
+    for name in "${names[@]}"; do [[ -f $stage/bin/$name ]] || cp -p --remove-destination -- "$stage/bin/python" "$stage/bin/$name"; done
+    replace_literal "$stage/pyvenv.cfg" "$stage" "$prefix"
+  else
+    rsync -a --checksum --exclude='/bin/***' --exclude='/lib/python*/site-packages/***' --exclude='/lib/python*/dist-packages/***' \
+      --exclude='/lib64/python*/site-packages/***' "$target_prefix/" "$stage/"
+    while IFS= read -r -d '' path; do
+      name=${path##*/}
+      if is_python_name "$name" || [[ $name =~ ^python[0-9.]+-config$ ]]; then cp -a --remove-destination -- "$path" "$stage/bin/$name"; fi
+    done < <(find "$target_prefix/bin" -mindepth 1 -maxdepth 1 -print0)
+    while IFS= read -r -d '' path; do
+      name=${path##*/}
+      is_python_name "$name" || continue
+      if is_elf "$path" || is_standard "$name" "$mm"; then cp -p --remove-destination -- "$target" "$path"; fi
+    done < <(find "$stage/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
+    while IFS= read -r -d '' path; do
+      replace_literal "$path" "$target_prefix" "$prefix"
+      candidate="$(jq -r .target.configured_prefix "$entry")"
+      [[ -z $candidate || $candidate == "$target_prefix" ]] || replace_literal "$path" "$candidate" "$prefix"
+    done < <(
+      find "$stage/lib" -type f \( -name '_sysconfigdata_*.py' -o -path '*/config-*/Makefile' -o -path '*/pkgconfig/python*.pc' \) -print0
+      find "$stage/bin" -maxdepth 1 -name 'python*-config' -type f -print0
+    )
+  fi
+}
+checkpoint() {
+  local entry=$1 journal=$2
+  shift 2
+  json_edit "$entry" "$@"
+  json_edit "$journal" --slurpfile entry "$entry" '.entries |= map(if .prefix==$entry[0].prefix then $entry[0] else . end)'
+}
+publish_tree() {
+  local source=$1 destination=$2
+  # Preserve the prefix directory; replace changed files and link types through
+  # rsync's temporary-file/rename publication, with checksum-based comparison.
+  rsync -a --checksum --delete "$source/" "$destination/"
+  sync -f "$destination"
+}
+restore_one() {
+  local entry=$1 journal=$2 prefix backup identity
+  prefix="$(jq -r .prefix "$entry")"
+  backup="$(jq -r .backup "$entry")"
+  [[ -d $backup && ! -L $prefix && -d $prefix ]] || die 'Rollback requires the original prefix and its backup'
+  identity="$(stat -Lc '%d:%i' -- "$prefix")"
+  [[ $identity == "$(jq -r .identity "$entry")" ]] || die "Rollback prefix identity changed: $prefix"
+  publish_tree "$backup" "$prefix"
+  checkpoint "$entry" "$journal" --arg at "$(now)" '.status="rolled_back"|.rolled_back_at=$at'
+  event rolled_back "$prefix"
+}
+worker_failure() {
+  local status=$1 entry=$2 journal=$3 prefix backup publication
+  trap - ERR INT TERM
+  set +e
+  prefix="$(jq -r .prefix "$entry")"
+  backup="$(jq -r .backup "$entry")"
+  publication="$(jq -r '.publication_started//false' "$entry")"
+  checkpoint "$entry" "$journal" --argjson exit "$status" '.error=("Update worker exited with status "+($exit|tostring))|.status="failed"'
+  if [[ $publication == true && -d $backup ]]; then bash "$SELF" _restore "$entry" "$journal" || checkpoint "$entry" "$journal" '.status="rollback_failed"'; fi
+  event failed "$prefix" "Worker exit $status"
+  exit "$status"
+}
+apply_one() {
+  local entry=$1 journal=$2 checks=$3 prefix stage backup kind version available size needed identity manifest packages_file result
+  trap 'worker_failure "$?" "$entry" "$journal"' ERR
+  trap 'worker_failure 130 "$entry" "$journal"' INT TERM
+  prefix="$(jq -r .prefix "$entry")"
+  stage="$(jq -r .stage "$entry")"
+  backup="$(jq -r .backup "$entry")"
+  kind="$(jq -r .kind "$entry")"
+  version="$(jq -r .target.version "$entry")"
+  [[ ! -L $prefix && -d $prefix && ! -e $stage && ! -e $backup ]]
+  [[ $(stat -Lc %u -- "$prefix") == "$EUID" ]]
+  identity="$(stat -Lc '%d:%i' -- "$prefix")"
+  available="$(df -PB1 -- "$prefix" | awk 'NR==2 {print $4}')"
+  size="$(du -sB1 -- "$prefix" | awk '{print $1}')"
+  needed=$((size * 3 + 104857600))
+  ((available > needed)) || die "Insufficient free space for stage and backup: $prefix"
+  checkpoint "$entry" "$journal" --arg identity "$identity" '.identity=$identity|.status="preparing"'
+  event prepare "$prefix" "$version"
+  cp -a --reflink=never -- "$prefix" "$stage"
+  patch_stage "$entry"
+  packages_file="$WORK/expected-packages.json"
+  jq .package_snapshot "$entry" >"$packages_file"
+  result="$WORK/staged-validation.json"
+  validate "$stage" "$version" "$packages_file" '' "$prefix" stage "$checks" "$result"
+  manifest="$WORK/runtime-hashes.json"
+  hashes "$stage" "$kind" "$manifest"
+  checkpoint "$entry" "$journal" --slurpfile hashes "$manifest" --slurpfile result "$result" '.runtime_hashes=$hashes[0]|.staged_validation=$result[0]|.status="prepared"'
+  [[ $(stat -Lc '%d:%i' -- "$prefix") == "$identity" ]]
+  cp -a --reflink=never -- "$prefix" "$backup"
+  checkpoint "$entry" "$journal" '.status="backed_up"|.publication_started=true'
+  publish_tree "$stage" "$prefix"
+  checkpoint "$entry" "$journal" '.status="installed"'
+  result="$WORK/final-validation.json"
+  validate "$prefix" "$version" "$packages_file" "$manifest" "$prefix" final "$checks" "$result"
+  checkpoint "$entry" "$journal" --slurpfile result "$result" --arg at "$(now)" '.validation=$result[0]|.status="verified"|.finished=$at'
+  # Retain the staged tree with the backup until the owner removes the journal's
+  # recovery artifacts. Verification must never depend on cleanup timing.
+  trap - ERR INT TERM
+  event verified "$prefix" "$version"
+}
+acquire_locks() {
+  local list=$1 parent fd
+  while IFS= read -r parent; do
+    exec {fd}>"$parent/${MARKER}lock"
+    flock -n "$fd" || die "Another updater holds $parent"
+    LOCK_FDS+=("$fd")
+  done < <(jq -r '.[]|.prefix|sub("/[^/]+$";"")' "$list" | sort -u)
+}
+rollback_entries() {
+  local journal=$1 entry path status failed=0
+  while IFS= read -r entry; do
+    status="$(jq -r .status <<<"$entry")"
+    path="$(jq -r .entry_file <<<"$entry")"
+    case "$status" in verified | installed | backed_up | prepared | rollback_failed)
+      if [[ -d $(jq -r .backup <<<"$entry") ]]; then bash "$SELF" _restore "$path" "$journal" || failed=1; fi
+      ;;
+    esac
+  done < <(jq -c '.entries|reverse[]' "$journal")
+  return "$failed"
+}
+apply_plan() {
+  local plan=$1 journal=$2 item prefix snapshot path token stage backup count=0 failed=0 fatal=0 base
+  local -A blocked=()
+  [[ ! -e $journal && ! -e $journal.entries ]] || die 'Journal exists; choose a new output path'
+  mkdir -p -- "$journal.entries"
+  jq '[.plan[]|select(.action=="update")]' "$plan" >"$WORK/lock-list.json"
+  acquire_locks "$WORK/lock-list.json"
+  jq -n --arg created "$(now)" --arg path "$journal" --slurpfile plan "$plan" \
+    '{schema:2,engine:"bash",created:$created,path:$path,complete:false,failures:0,entries:[],failed_snapshots:[],
+      skipped:[$plan[0].plan[]|select(.action=="skip")|{prefix,version,reason}],
+      end_of_support:[$plan[0].plan[]|select(.eol!="")|{prefix,version,eol}],discovery_warnings:$plan[0].inventory.warnings}' | atomic_write "$journal"
+  : >"$WORK/prepared-plan.ndjson"
+  while IFS= read -r item; do
+    [[ $(jq -r .action <<<"$item") == update ]] || {
+      printf '%s\n' "$item" >>"$WORK/prepared-plan.ndjson"
+      continue
+    }
+    prefix="$(jq -r .prefix <<<"$item")"
+    snapshot="$(mktemp "$WORK/snapshot.XXXXXX")"
+    if packages "$prefix" "$snapshot" 2>"$WORK/snapshot-error"; then
+      jq -c --slurpfile snapshot "$snapshot" '.+{package_snapshot:$snapshot[0]}' <<<"$item" >>"$WORK/prepared-plan.ndjson"
+    else
+      failed=$((failed + 1))
+      base="$(jq -r .base_prefix <<<"$item")"
+      [[ $(jq -r .kind <<<"$item") != venv ]] || blocked[$base]=1
+      json_edit "$journal" --arg prefix "$prefix" --arg error "$(cat "$WORK/snapshot-error")" '.failed_snapshots += [{prefix:$prefix,error:$error}]'
+      jq -c '.action="skip"|.reason="Package snapshot failed"' <<<"$item" >>"$WORK/prepared-plan.ndjson"
+    fi
+  done < <(jq -c '.plan[]' "$plan")
+  while IFS= read -r item; do
+    prefix="$(jq -r .prefix <<<"$item")"
+    if [[ $(jq -r .kind <<<"$item") == raw && ${blocked[$prefix]+yes} ]]; then
+      item="$(jq -c '.action="skip"|.reason="Dependent venv snapshot failed; raw base left unchanged"' <<<"$item")"
+      json_edit "$journal" --arg prefix "$prefix" '.skipped += [{prefix:$prefix,reason:"Dependent venv snapshot failed; raw base left unchanged"}]'
+    fi
+    if [[ $(jq -r .action <<<"$item") != update ]]; then
+      event skip "$prefix" "$(jq -r .reason <<<"$item")"
+      continue
+    fi
+    count=$((count + 1))
+    token="${BASHPID}-${RANDOM}-${count}"
+    stage=$prefix$MARKER$token.stage
+    backup=$prefix$MARKER$token.backup
+    path="$journal.entries/$count.json"
+    jq --arg stage "$stage" --arg backup "$backup" --arg entry_file "$path" '.+{stage:$stage,backup:$backup,entry_file:$entry_file,status:"pending",old_version:.version}' <<<"$item" | atomic_write "$path"
+    json_edit "$journal" --slurpfile entry "$path" '.entries += [$entry[0]]'
+    if ! bash "$SELF" _apply-one "$path" "$journal" "$CHECKS"; then
+      failed=$((failed + 1))
+      fatal=1
+      rollback_entries "$journal" || failed=$((failed + 1))
+      break
+    fi
+  done <"$WORK/prepared-plan.ndjson"
+  json_edit "$journal" --argjson failures "$failed" --arg finished "$(now)" '.complete=true|.finished=$finished|.failures=$failures'
+  if ((fatal == 0)); then
+    local -a verify_args=(verify "$journal" --output "$journal.post-verify.json")
+    [[ -z $CHECKS ]] || verify_args+=(--checks "$CHECKS")
+    if ! bash "$SELF" "${verify_args[@]}"; then
+      if [[ ! -s $journal.post-verify.json ]] || jq -e '.results[]|select(.passed==false and .snapshot_failed!=true)' "$journal.post-verify.json" >/dev/null; then rollback_entries "$journal" || true; fi
+      failed=$((failed + 1))
+      json_edit "$journal" --argjson failures "$failed" '.failures=$failures'
+    fi
+  fi
+  ((failed == 0))
+}
+verify_journal() {
+  local journal=$1 destination=$2 entry prefix packages_file manifest result failed=0
+  : >"$WORK/verification.ndjson"
+  while IFS= read -r entry; do
+    jq -c '.+{passed:false,snapshot_failed:true}' <<<"$entry" >>"$WORK/verification.ndjson"
+    failed=$((failed + 1))
+  done < <(jq -c '.failed_snapshots[]?' "$journal")
+  while IFS= read -r entry; do
+    prefix="$(jq -r .prefix <<<"$entry")"
+    if [[ $(jq -r .status <<<"$entry") != verified ]]; then
+      jq -cn --arg prefix "$prefix" --arg status "$(jq -r .status <<<"$entry")" '{prefix:$prefix,passed:false,error:$status}' >>"$WORK/verification.ndjson"
+      failed=$((failed + 1))
+      continue
+    fi
+    packages_file="$(mktemp "$WORK/expected.XXXXXX")"
+    manifest="$(mktemp "$WORK/manifest.XXXXXX")"
+    result="$(mktemp "$WORK/result.XXXXXX")"
+    jq .package_snapshot <<<"$entry" >"$packages_file"
+    jq .runtime_hashes <<<"$entry" >"$manifest"
+    if validate "$prefix" "$(jq -r .target.version <<<"$entry")" "$packages_file" "$manifest" "$prefix" final "$CHECKS" "$result" 2>"$WORK/verify-error"; then
+      jq -cn --arg prefix "$prefix" --slurpfile validation "$result" '{prefix:$prefix,passed:true,validation:$validation[0]}' >>"$WORK/verification.ndjson"
+    else
+      failed=$((failed + 1))
+      jq -cn --arg prefix "$prefix" --arg error "$(cat "$WORK/verify-error")" '{prefix:$prefix,passed:false,error:$error}' >>"$WORK/verification.ndjson"
+    fi
+  done < <(jq -c '.entries[]' "$journal")
+  jq -n --arg created "$(now)" --slurpfile results "$WORK/verification.ndjson" '{created:$created,engine:"bash",results:$results}' | atomic_write "$destination"
+  jq -c '{event:"verification",passed:([.results[]|select(.passed)]|length),failed:([.results[]|select(.passed==false)]|length),unresolved_aliases:([.results[].validation.unresolved_aliases[]?]|length)}' "$destination"
+  ((failed == 0))
+}
+main() {
+  require_tools
+  WORK="$(mktemp -d)"
+  COMMAND=${1:---help}
+  shift || true
+  case "$COMMAND" in
+    -h | --help | help)
+      usage
+      return
+      ;;
+    _apply-one)
+      root_guard
+      apply_one "$@"
+      return
+      ;;
+    _restore)
+      root_guard
+      restore_one "$@"
+      return
+      ;;
+    scan | plan | apply) ;;
+    verify | rollback)
+      (($#)) || die 'Journal path required'
+      JOURNAL="$(absolute "$1")"
+      shift
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  root_guard
+  while (($#)); do
+    case "$1" in
+      --output | --checks | --exclude | --target)
+        (($# >= 2)) || die "Missing value for $1"
+        case "$1" in
+          --output) OUTPUT="$(absolute "$2")" ;;
+          --checks) CHECKS="$(canonical "$2")" ;;
+          --exclude) EXCLUDES+=("$(absolute "$2")") ;;
+          --target) TARGET_SPECS+=("$2") ;;
+        esac
+        shift 2
+        ;;
+      --)
+        shift
+        ROOTS+=("$@")
+        break
+        ;;
+      -*) die "Unknown option: $1" ;;
+      *)
+        ROOTS+=("$(absolute "$1")")
+        shift
+        ;;
+    esac
+  done
+  if [[ -n $CHECKS ]]; then jq -e 'type=="object" and all(.[];type=="array" and all(.[];.argv|type=="array" and length>0 and all(.[];type=="string")))' "$CHECKS" >/dev/null || die 'Invalid application checks JSON'; fi
+  if [[ -n $JOURNAL ]]; then
+    jq -e '.schema==2 and .engine=="bash" and (.entries|type=="array")' "$JOURNAL" >/dev/null || die 'Expected a native Bash schema-2 journal'
+  fi
+  case "$COMMAND" in
+    scan | plan | apply)
+      ((${#ROOTS[@]})) || die 'At least one trusted search root is required'
+      [[ -n $OUTPUT ]] || die '--output is required'
+      if [[ $COMMAND != scan ]]; then
+        ((${#TARGET_SPECS[@]})) || die '--target is required'
+        load_targets
+      fi
+      scan "$WORK/inventory.json"
+      if [[ $COMMAND == scan ]]; then
+        atomic_write "$OUTPUT" <"$WORK/inventory.json"
+        event scanned '' "$(jq '.environments|length' "$OUTPUT") environments"
+        return
+      fi
+      make_plan "$WORK/inventory.json" "$WORK/plan.json"
+      if [[ $COMMAND == plan ]]; then
+        atomic_write "$OUTPUT" <"$WORK/plan.json"
+        event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$OUTPUT") updates"
+        return
+      fi
+      apply_plan "$WORK/plan.json" "$OUTPUT"
+      ;;
+    verify)
+      [[ -n $OUTPUT ]] || die '--output is required'
+      verify_journal "$JOURNAL" "$OUTPUT"
+      ;;
+    rollback)
+      jq .entries "$JOURNAL" >"$WORK/lock-list.json"
+      acquire_locks "$WORK/lock-list.json"
+      rollback_entries "$JOURNAL"
+      ;;
+  esac
+}
+main "$@"

@@ -116,11 +116,17 @@ Installing a new prefix leaves existing venv interpreter references in place. Us
 installations and venvs. See [update_python_envs.md](update_python_envs.md) for
 planning, validation, backups, rollback, and directory-link handling.
 
+Both scripts use native Bash and Unix utilities, with no embedded Python source.
+Interpreter checks use version and module command interfaces. Reuse validates
+core imports and pip; an incomplete installation with the expected version is
+rebuilt, while a prefix containing another version is rejected. Cached source
+archives undergo signature verification on reuse.
+
 ```bash
 bash install_python.sh /path/to/patched-runtimes --skip-conda --jobs 4 --no-bashrc
 ```
 
-Release policy checked on 2026-11-01. Python 3.8 and 3.10 have reached end of
+Release policy checked on 2026-11-02. Python 3.8 and 3.10 have reached end of
 support. Their final patch releases require explicit selection and emit a
 warning. Migration to a supported branch is required for ongoing security
 maintenance. The CPython updater delegates existing Conda environments to the

@@ -15,7 +15,7 @@ umask 022
 # ---- better failure signal (does not change control flow, only diagnostics) ----
 trap 'echo "FATAL: failed at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" >&2' ERR
 
-# ===== release policy checked 2026-11-01 =====
+# ===== release policy checked 2026-11-02 =====
 # Supported branches are the default; legacy branches require --py.
 PY38="3.8.20"
 PY310="3.10.22"
@@ -286,6 +286,21 @@ download_python() {
   verify_python "${tar}" "${sig}"
 }
 
+check_python_modules() {
+  local pybin="$1" check_dir module failed=0
+  check_dir="$(mktemp -d "${BASE_DIR}/CACHE/tmp/python-imports.XXXXXX")"
+  (
+    cd "${check_dir}" || exit 1
+    "${pybin}" -I -m pydoc -w ssl sqlite3 lzma bz2 readline uuid ctypes tkinter >/dev/null
+  ) || failed=1
+  for module in ssl sqlite3 lzma bz2 readline uuid ctypes tkinter; do
+    [[ -s "${check_dir}/${module}.html" ]] || failed=1
+  done
+  rm -rf -- "${check_dir}"
+  "${pybin}" -I -m pip --version || failed=1
+  ((failed == 0))
+}
+
 build_install_python() {
   local ver="$1"
   local majmin="$2"
@@ -296,10 +311,14 @@ build_install_python() {
 
   if [[ -x "${pybin}" ]]; then
     local installed
-    installed="$("${pybin}" -I -c 'import platform; print(platform.python_version())')"
+    installed="$("${pybin}" -I --version)"
+    installed="${installed#Python }"
     [[ "${installed}" == "${ver}" ]] || die "Prefix ${prefix} contains Python ${installed}; expected ${ver}"
-    log "Python ${ver} installed at ${pybin}; skipping build"
-    return 0
+    if check_python_modules "${pybin}"; then
+      log "Python ${ver} installed and validated at ${pybin}; skipping build"
+      return 0
+    fi
+    log "Incomplete Python ${ver} installation; rebuilding ${prefix}"
   fi
 
   log "Extracting Python ${ver}"
@@ -314,9 +333,7 @@ build_install_python() {
 
   log "Sanity check Python ${ver}"
   "${pybin}" -V
-  "${pybin}" -c "import ssl,sqlite3,lzma,bz2,readline,uuid,ctypes; print('ssl=',ssl.OPENSSL_VERSION)"
-  "${pybin}" -c "import tkinter; print('tkinter=ok')" >/dev/null 2>&1 || die "tkinter missing (check tk-dev)"
-  "${pybin}" -m pip --version
+  check_python_modules "${pybin}" || die "Python ${ver} failed its module checks"
 }
 
 write_env_common() {
@@ -541,7 +558,10 @@ tests() {
     local bin="$1" expected="$2"
     if [[ -x "${bin}" ]]; then
       log "Testing ${bin}..."
-      "${bin}" python -c 'import sys; assert sys.version.split()[0] == sys.argv[1], sys.version; print(sys.executable, sys.version.split()[0])' "${expected}"
+      local actual
+      actual="$("${bin}" python -I --version)"
+      [[ "${actual}" == "Python ${expected}" ]] || die "Wrapper ${bin} selected ${actual}; expected ${expected}"
+      log "${actual} through ${bin}"
       "${bin}" python -m pip --version
     else
       # Optional: log that we are skipping it
