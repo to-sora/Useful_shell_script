@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # NOTE: keep original structure/order as much as possible for easy git diff
 
+# One release policy for installation and same-minor patch planning.
+PY38="3.8.20"
+PY310="3.10.22"
+PY311="3.11.18"
+PY313="3.13.18"
+PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")
+if [[ $# == 1 && $1 == --print-pins ]]; then
+  printf '%s\n' "${PY_VERSIONS[@]}"
+  exit 0
+fi
+
 # ---- run-as-user safety (original intent, strengthened) ----
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   echo "FATAL: do not run as root; run as a normal user." >&2; exit 1
@@ -14,14 +25,6 @@ umask 022
 
 # ---- better failure signal (does not change control flow, only diagnostics) ----
 trap 'echo "FATAL: failed at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" >&2' ERR
-
-# ===== release policy checked 2026-11-02 =====
-# Supported branches are the default; legacy branches require --py.
-PY38="3.8.20"
-PY310="3.10.22"
-PY311="3.11.18"
-PY313="3.13.18"
-PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")   # build newest first
 
 MINIFORGE_VER="26.9.4-1"
 MINIFORGE_FN="Miniforge3-${MINIFORGE_VER}-Linux-x86_64.sh"
@@ -39,6 +42,7 @@ BUILD_JOBS="$(nproc)"
 usage() {
   cat >&2 <<EOF
 Usage:
+  bash $0 --print-pins
   bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--skip-conda] [--jobs N]
 
 Notes:
@@ -291,11 +295,15 @@ check_python_modules() {
   check_dir="$(mktemp -d "${BASE_DIR}/CACHE/tmp/python-imports.XXXXXX")"
   (
     cd "${check_dir}" || exit 1
-    "${pybin}" -I -m pydoc -w ssl sqlite3 lzma bz2 readline uuid ctypes tkinter >/dev/null
+    "${pybin}" -I -m pydoc -w ssl sqlite3 lzma bz2 readline uuid ctypes tkinter >imports.log 2>&1
   ) || failed=1
   for module in ssl sqlite3 lzma bz2 readline uuid ctypes tkinter; do
-    [[ -s "${check_dir}/${module}.html" ]] || failed=1
+    if [[ ! -s "${check_dir}/${module}.html" ]]; then
+      printf 'Module check failed: %s (%s)\n' "${module}" "${pybin}" >&2
+      failed=1
+    fi
   done
+  if ((failed)) && [[ -f ${check_dir}/imports.log ]]; then cat "${check_dir}/imports.log" >&2; fi
   rm -rf -- "${check_dir}"
   "${pybin}" -I -m pip --version || failed=1
   ((failed == 0))

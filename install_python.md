@@ -122,6 +122,10 @@ core imports and pip; an incomplete installation with the expected version is
 rebuilt, while a prefix containing another version is rejected. Cached source
 archives undergo signature verification on reuse.
 
+A failed import check prints the module name and interpreter path. Run
+`bash install_python.sh --print-pins` to list the versions used by both the
+installer and updater. This command runs without preparing an installation.
+
 ```bash
 bash install_python.sh /path/to/patched-runtimes --skip-conda --jobs 4 --no-bashrc
 ```

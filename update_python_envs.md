@@ -14,20 +14,26 @@ Use trusted roots owned by the invoking account: discovery executes candidate
 interpreters. Run without sudo. Host-root execution is rejected; a disposable
 container with the sole UID mapping `0 0 1` is the test exception.
 
-The scan follows directory links, including links to targets outside the supplied
-roots. GNU find reports link cycles. Environment names do not determine detection:
-`pyvenv.cfg` and actual ELF `bin/python*` executables identify candidates. Each
-binary is invoked through its discovered path, so interpreter symlinks retain
-venv identity. `python -I -m sysconfig` supplies the prefix, base prefix, SOABI,
-architecture, and build settings. Canonical prefixes deduplicate aliases.
+The scan resolves each supplied root and walks its physical directories. It prunes
+`.git`, `node_modules`, exclusions, and updater work directories. A directory link
+under a root is recorded in the inventory. To include an external environment,
+supply its directory or the link to it as another root. This handles aliases
+and cycles without entering other trees. An interpreter link to an external
+base also requires that base as a root. A copied venv can use an explicit patch
+target when its original base is outside the scan.
+
+Discovery requires a venv configuration or a CPython standard library in the
+prefix. It checks the resolved binary's scope before invoking it through its
+`bin/python*` path and checks that its reported prefix matches the directory
+being inspected. `python -I -m sysconfig` supplies the identity and ABI.
 
 Updates preserve the Python minor branch, installed package versions, console
 scripts, and activation paths. The tool rejects downgrades and ABI mismatches;
 it skips distribution/runtime-managed prefixes, Conda prefixes/package caches,
 shared raw builds, and prefixes with linked `bin` or `lib` subdirectories.
-Directory links to whole environments are supported. Conda needs its own solver.
-Legacy or unusable environments need a rebuild. A referenced raw base outside the
-scanned trees is reported and skipped until its path is supplied as a root.
+System directories and the runtime tree named by `CODEX_PRIMARY_RUNTIME_ROOT`
+are protected. Use `--exclude` for other managed installations. Conda needs its
+own solver. Legacy or unusable environments need a rebuild.
 
 Package records are read from `*.dist-info/METADATA` and `*.egg-info/PKG-INFO`
 in the prefix's standard site-packages/dist-packages directories. Inherited base
@@ -41,8 +47,10 @@ Names containing `.pyenv-update-` are reserved and excluded from discovery.
 
 ## Targets, scan, and plan
 
-Policy checked on 2026-11-02: minimum targets are 3.8.20, 3.10.22, 3.11.18, and
-3.13.18. Newer stable patch releases in these branches may be supplied. Python
+Plan and apply read the minimum target versions from the adjacent installer.
+Run `bash install_python.sh --print-pins` to print them. Scan, verify, and
+rollback can run with the updater alone. Newer stable patch releases in the
+listed branches may be supplied. Python
 3.8 and 3.10 have reached end of support. Their final releases do not provide
 ongoing security maintenance; migration requires a supported minor branch.
 
@@ -64,8 +72,7 @@ bash update_python_envs.sh plan /path/to/projects /path/to/raw-installs \
 ```
 
 Review prefixes, binary aliases, discovery warnings, and skip reasons. Repeat
-`--exclude /path` to exclude trees. Supplying a directory link authorizes traversal
-to its target. Standard broken aliases (`python`, `python3`, `python<minor>`)
+`--exclude /path` to exclude trees. Standard broken aliases (`python`, `python3`, `python<minor>`)
 are repaired when another binary identifies the environment. Unknown broken
 aliases such as `python999 -> /missing/python` remain unresolved findings.
 
@@ -76,7 +83,9 @@ environments. Publication and rollback
 span multiple file operations; neither provides a live-process upgrade or crash
 atomicity. Retain disk space for a full stage and backup. The prefix directory
 keeps its identity. Rsync replaces changed files and link types through temporary
-files and renames, including transitions between symlinks and copied binaries.
+files and renames. Publication and rollback use rsync with hard links, ACLs and
+extended attributes enabled. The filesystem and account must support those
+attributes. Venv upgrades preserve the original `pyvenv.cfg` prompt record.
 
 ```bash
 bash update_python_envs.sh apply /path/to/projects /path/to/raw-installs \
@@ -93,7 +102,7 @@ bash update_python_envs.sh rollback update-journal.json
 `--checks` is optional. JSON keys are absolute-prefix glob patterns; values are
 lists of argument arrays. Commands run without an implicit shell. `{python}`
 expands to the environment's Python binary; `{prefix}` expands to the current
-prefix. Use `final_only` for existing console scripts that name the live prefix
+prefix. Checks receive EOF on standard input. Use `final_only` for existing console scripts that name the live prefix
 in their shebang. Checks must have no unwanted side effects.
 
 ```json
@@ -102,15 +111,16 @@ in their shebang. Checks must have no unwanted side effects.
     {"argv": ["{prefix}/bin/llamafactory-cli", "version"], "final_only": true}
   ],
   "*/venv": [
-    {"argv": ["{python}", "-I", "-m", "pip", "check"], "timeout": 120}
+    {"argv": ["{python}", "-I", "-m", "pip", "--version"], "timeout": 120}
   ]
 }
 ```
 
-The script snapshots package metadata before changing any raw base. Staged and
-installed environments must pass version/prefix checks for every interpreter,
-core-module imports, package-inventory comparison, `pip check` when available,
-and supplied application checks. Runtime binary/native-module hashes protect
+The script snapshots package metadata and the conflicts reported by `pip check`
+before changing any raw base. Existing conflicts are recorded in the journal.
+New conflicts or a failure to run pip fail validation. Each staged and installed
+environment must pass version/prefix checks, core-module imports, package
+inventory comparison, and supplied application checks. Runtime binary/native-module hashes protect
 verification. A fresh Bash process verifies the complete batch and writes
 `<journal>.post-verify.json`.
 
@@ -121,9 +131,12 @@ peers may update using a separate target. Skips and EOL/unknown-alias findings
 remain visible even when the supported updates pass. No claim of complete
 vulnerability elimination is implied by a zero exit status.
 
-Keep the journal, adjacent `<journal>.entries/` directory, and adjacent-prefix
-`.pyenv-update-*.backup` and `.pyenv-update-*.stage` directories together for
-recovery. Staged trees and backups are retained until removed by the owner.
+Keep the journal, adjacent `<journal>.entries/` directory and each
+`.pyenv-update-*.backup` for recovery. Rollback restores a prefix only after
+the worker has finished the backup and recorded `publication_started: true`.
+A `prepared` entry can have a partial backup. Rollback leaves that prefix
+untouched. Verification releases the stage. Interrupted runs can leave a stage
+or partial backup for inspection.
 Journal schema 2 is
 for this Bash implementation; journals from the former Python engine are not
 compatible. The locks prevent concurrent updater instances in the same parent
@@ -131,6 +144,62 @@ directories. Interrupted operations require journal review and rollback before
 applications restart.
 
 ## Validation
+
+The Bash regression suite takes two private interpreter binaries from the same
+minor branch. It creates disposable venvs, a partial backup, and an installation
+with a missing module. It requires `setfacl`, `getfacl`, `setfattr`, and
+`getfattr` on a filesystem that supports ACLs and user xattrs.
+
+```bash
+bash tests/python-updater.bash /path/to/old/bin/python3.11 /path/to/patched/bin/python3.11
+```
+
+### November 8 review and compatibility tests
+
+The original installer at `868050e` and the revised installer built all eight
+releases in the matrix below on Ubuntu 24.04 x86-64. Source signatures passed
+for all eight archives. Test copies adapted the installer root guard, tar
+ownership and build parallelism for the single-UID container. Both Miniforge
+installations completed. A damaged archive and wrong-version prefix were
+rejected. Removing the SQLite extension from a private 3.11 installation
+produced a diagnostic naming `sqlite3`, a successful rebuild and a successful
+reuse check.
+
+The regression suite passed on 3.8, 3.10, 3.11 and 3.13. A backup-copy fixture
+created a partial backup and sent `SIGKILL` to the update worker. Rollback
+preserved the live sentinel and interpreter. Direct restore rejected the
+unpublished entry. An existing unsatisfied pip dependency passed the update,
+and adding another dependency to the same distribution caused verification
+to fail. Probe tracing found zero invocations of the external, `.git`,
+`node_modules` or unrelated executable fixtures. A linked environment supplied
+as a root was discovered. Prompt records, ACLs, user xattrs and hard links
+survived publication and rollback. A check reading stdin received EOF, its
+next check ran, and both venvs in that batch were updated.
+
+An edit to the running test copy interrupted the first full batch. Its rollback
+restored all 30 published prefixes. Restored versions, package lists, prompts,
+activation files and application boots matched the baseline. The repeat used
+fixed copies of the release scripts and verified their SHA-256 hashes.
+
+The repeat updated four raw installations, eight tool venvs on each of the four
+branches, and three application venvs. **All 39 prefixes and 109 working
+interpreter entries passed independent verification.** All 32 tool venvs
+activated and retained their package versions and prompt records. The eight
+installer entry points passed. Every verified stage had been removed, and
+the next plan proposed zero updates. The inventory reported four pre-existing
+broken `python999` links and skipped two Conda-managed prefixes.
+
+| Application | CPU checks before and after the update | Package versions preserved |
+|---|---|---:|
+| LLaMA-Factory | CLI and Web UI, HTTP 200 for the page and configuration, 290 components | 111 |
+| ComfyUI | Server, 1,033 nodes, 64×64 PNG from EmptyImage and SaveImage | 85 |
+| llama.cpp | Converter help, 57 GGUF tensors, server health, identical eight-token completion | 29 |
+
+All four original releases failed the upstream regression cases for
+CVE-2026-15806 and CVE-2026-82049. The updated 3.10.22, 3.11.18 and 3.13.18
+releases passed both cases. Python 3.8.20 failed both.
+
+### November 2 installation and application tests
 
 Tested on 2026-11-02 in an Ubuntu 24.04 x86-64 CPU container. Baseline installer:
 `868050ea7617e49710df890e335c33443ab2c4a0`. All eight old/target CPython releases

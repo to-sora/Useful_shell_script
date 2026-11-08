@@ -7,9 +7,8 @@ export LC_ALL=C
 SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
 MARKER='.pyenv-update-'
 WORK=''
-declare -a ROOTS=() EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
+declare -a ROOTS=() EXCLUDES=() SCAN_ROOTS=() SCAN_EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
-declare -A FLOORS=([3.8]=3.8.20 [3.10]=3.10.22 [3.11]=3.11.18 [3.13]=3.13.18)
 declare -A EOL=([3.8]=2024-10-07 [3.9]=2025-10-31 [3.10]=2026-10-01)
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -28,7 +27,8 @@ Usage:
   update_python_envs.sh rollback JOURNAL
 
 Options: --exclude PATH (repeatable), --checks checks.json (apply/verify).
-Discovery follows directory links and probes actual ELF interpreter binaries.
+Discovery probes interpreter binaries within the supplied roots. Supply the
+linked directory or interpreter base as another root to include an external target.
 All control flow, discovery, JSON, copying, validation, and recovery use Bash and
 Unix utilities. Python is invoked through existing version/module commands.
 Stop applications before apply or rollback. Use trusted private installation roots.
@@ -57,7 +57,7 @@ canonical() {
   safe_path "$1"
   realpath -e -- "$1"
 }
-within() { [[ $1 == "$2" || $1 == "$2/"* ]]; }
+within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
 stable_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 minor() { printf '%s\n' "${1%.*}"; }
 is_python_name() { [[ $1 =~ ^python([0-9]+(\.[0-9]+)*)?$ ]]; }
@@ -130,90 +130,120 @@ json_edit() {
 }
 event() { jq -cn --arg event "$1" --arg prefix "${2:-}" --arg detail "${3:-}" '{event:$event,prefix:$prefix,detail:$detail}'; }
 warning() { jq -cn --arg path "$1" --arg reason "$2" '{path:$path,reason:$reason}' >>"$WORK/warnings.ndjson"; }
+scan_path_allowed() {
+  local path=$1 root
+  case "/${path#/}/" in */.git/* | */node_modules/* | *"$MARKER"*) return 1 ;; esac
+  for root in "${SCAN_EXCLUDES[@]}"; do within "$path" "$root" && return 1; done
+  for root in "${SCAN_ROOTS[@]}"; do within "$path" "$root" && return 0; done
+  return 1
+}
 scan() {
-  local destination=$1 root path name info base mm bin exclude line prefix skip status=0
-  local -a find_roots=() canonical_excludes=() expression=('(' -name "*$MARKER*" -prune)
-  local -A seen=() prefixes=()
-  : >"$WORK/candidates"
+  local destination=$1 root path name resolved prefix base info marker line status=0
+  local -a expression=('(' -name "*$MARKER*" -o -name .git -o -path '*/.git/*' -o -name node_modules -o -path '*/node_modules/*')
+  local -A seen=()
+  SCAN_ROOTS=()
+  SCAN_EXCLUDES=()
   : >"$WORK/probes.ndjson"
   : >"$WORK/warnings.ndjson"
   : >"$WORK/links.ndjson"
-  for exclude in "${EXCLUDES[@]}"; do
-    canonical_excludes+=("$(realpath -m -- "$exclude")")
-    expression+=(-o -path "$(absolute "$exclude")" -prune -o -path "${canonical_excludes[-1]}" -prune)
+  : >"$WORK/found"
+  for path in "${EXCLUDES[@]}"; do
+    resolved="$(realpath -m -- "$path")"
+    SCAN_EXCLUDES+=("$resolved")
+    expression+=(-o -path "$resolved")
   done
-  expression+=(')' -o '(' -name pyvenv.cfg -o -path '*/bin/python*' -o -xtype l ')' -print0)
+  expression+=(')' -prune -o '(' -type l -o -name pyvenv.cfg -o -path '*/bin/python*' ')' -print0)
   for root in "${ROOTS[@]}"; do
-    root="$(absolute "$root")"
-    if [[ -e $root || -L $root ]]; then find_roots+=("$root"); else warning "$root" 'Missing search root'; fi
-    [[ ! -f $root ]] || printf '%s\0' "$root" >>"$WORK/candidates"
+    if [[ ! -e $root ]]; then
+      warning "$root" 'Missing search root'
+      continue
+    fi
+    resolved="$(canonical "$root")"
+    SCAN_ROOTS+=("$resolved")
+    if [[ -L $root ]]; then
+      jq -cn --arg path "$root" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
+    fi
   done
-  if ((${#find_roots[@]})); then
-    find -L "${find_roots[@]}" "${expression[@]}" >"$WORK/found" 2>"$WORK/find-errors" || status=$?
+  # A physical walk reaches in-root directories without descending via aliases.
+  # Only a link supplied as a root grants access to an external directory.
+  if ((${#SCAN_ROOTS[@]})); then
+    find -P "${SCAN_ROOTS[@]}" "${expression[@]}" >"$WORK/found" 2>"$WORK/find-errors" || status=$?
     while IFS= read -r line; do warning '' "$line"; done <"$WORK/find-errors"
-    while IFS= read -r -d '' path; do
-      safe_path "$path"
-      if [[ -L $path ]]; then
-        jq -cn --arg path "$path" --arg target "$(realpath -m -- "$path")" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
-        [[ -e $path ]] || warning "$path" 'Broken link'
-      fi
-      name=${path##*/}
-      if [[ $name == pyvenv.cfg && -f $path ]]; then
-        bin=${path%/*}/bin
-        if [[ -d $bin ]]; then
-          find "$bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0 >>"$WORK/candidates"
-        else warning "${path%/*}" 'pyvenv.cfg has no bin directory'; fi
-      elif is_python_name "$name"; then printf '%s\0' "$path" >>"$WORK/candidates"; fi
-    done <"$WORK/found"
   fi
   while IFS= read -r -d '' path; do
-    name=${path##*/}
-    is_python_name "$name" || continue
+    safe_path "$path"
+    scan_path_allowed "$path" || continue
     [[ ! ${seen[$path]+yes} ]] || continue
     seen[$path]=1
-    if info="$(probe "$path")"; then
-      prefix="$(jq -r .prefix <<<"$info")"
-      skip=0
-      for exclude in "${canonical_excludes[@]}"; do
-        if within "$prefix" "$exclude"; then
-          skip=1
-          break
-        fi
-      done
-      ((skip == 0)) || continue
-      printf '%s\n' "$info" >>"$WORK/probes.ndjson"
-      prefixes[$prefix]=1
-    else warning "$path" 'Missing, non-ELF, or unusable CPython interpreter'; fi
-  done <"$WORK/candidates"
-  cp -- "$WORK/probes.ndjson" "$WORK/references.ndjson"
-  while IFS= read -r info; do
-    [[ $(jq -r .kind <<<"$info") == venv ]] || continue
+    if [[ -L $path ]]; then
+      resolved="$(realpath -m -- "$path")"
+      jq -cn --arg path "$path" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
+      if ! scan_path_allowed "$resolved"; then
+        warning "$path" 'Link target outside discovery scope'
+        continue
+      fi
+      if [[ ! -e $path ]]; then
+        warning "$path" 'Broken link'
+        continue
+      fi
+    fi
+    if [[ ${path##*/} == pyvenv.cfg && ! -d ${path%/*}/bin ]]; then
+      warning "${path%/*}" 'pyvenv.cfg has no bin directory'
+    fi
+    name=${path##*/}
+    is_python_name "$name" && [[ $path == */bin/"$name" ]] || continue
+    prefix=${path%/bin/*}
+    scan_path_allowed "$prefix" || continue
+    # An arbitrary executable named python in a project bin directory is not
+    # enough. Require a venv config or a CPython standard library in the prefix.
+    marker=''
+    for root in "$prefix/pyvenv.cfg" "$prefix"/lib/python*/os.py "$prefix"/lib64/python*/os.py; do
+      if [[ -f $root ]] && scan_path_allowed "$(canonical "$root")"; then
+        marker=$root
+        break
+      fi
+    done
+    [[ -n $marker ]] || continue
+    if ! info="$(probe "$path")"; then
+      warning "$path" 'Missing, non-ELF, or unusable CPython interpreter'
+      continue
+    fi
+    if [[ $(jq -r .prefix <<<"$info") != "$prefix" ]]; then
+      warning "$path" 'Interpreter reports a different prefix'
+      continue
+    fi
     base="$(jq -r .base_prefix <<<"$info")"
-    [[ ! ${prefixes[$base]+yes} ]] || continue
-    mm="$(minor "$(jq -r .version <<<"$info")")"
-    if info="$(probe "$base/bin/python$mm")"; then
-      jq -c '.+{referenced_only:true}' <<<"$info" >>"$WORK/probes.ndjson"
-      prefixes[$base]=1
-    else warning "$base" 'Referenced raw base has no usable versioned binary'; fi
-  done <"$WORK/references.ndjson"
+    if scan_path_allowed "$(realpath -m -- "$base/bin/python$(minor "$(jq -r .version <<<"$info")")")"; then
+      jq -c '.+{base_in_scope:true}' <<<"$info" >>"$WORK/probes.ndjson"
+    else
+      printf '%s\n' "$info" >>"$WORK/probes.ndjson"
+      warning "$base" 'Referenced base outside discovery scope; add its directory as a root'
+    fi
+  done <"$WORK/found"
   jq -s 'group_by(.prefix)|map(.[0] as $first|$first+{aliases:(map(.binary)|unique),
     binaries:map({path:.binary,version:.version,resolved:.resolved}),versions:(map(.version)|unique)})|sort_by(.prefix)' "$WORK/probes.ndjson" >"$WORK/environments.json"
   jq -n --arg created "$(now)" --argjson walk_status "$status" --slurpfile environments "$WORK/environments.json" \
     --slurpfile warnings "$WORK/warnings.ndjson" --slurpfile links "$WORK/links.ndjson" \
-    '{created:$created,engine:"bash",walk_status:$walk_status,environments:$environments[0],warnings:$warnings,symlinks:$links}' | atomic_write "$destination"
+    '{created:$created,engine:"bash",walk_status:$walk_status,environments:$environments[0],warnings:($warnings|unique),symlinks:($links|unique)}' | atomic_write "$destination"
 }
 load_targets() {
-  local spec mm path info version prefix floor
+  local spec mm path info version prefix floor pins
+  local -A floors=()
+  pins="$(bash "${SELF%/*}/install_python.sh" --print-pins)" || die 'Cannot read release pins from the adjacent install_python.sh'
+  while IFS= read -r version; do
+    stable_version "$version" || die 'Installer returned an invalid release pin'
+    floors[${version%.*}]=$version
+  done <<<"$pins"
   : >"$WORK/targets.ndjson"
   for spec in "${TARGET_SPECS[@]}"; do
     [[ $spec == *=* ]] || die 'Target syntax: MINOR=/absolute/path/bin/python'
     mm=${spec%%=*}
     path=${spec#*=}
-    [[ ${FLOORS[$mm]+yes} ]] || die "No tested release policy for Python $mm"
+    [[ $mm =~ ^[0-9]+\.[0-9]+$ && ${floors[$mm]+yes} ]] || die "No tested release policy for Python $mm"
     info="$(probe "$path")" || die "Target is not a working CPython ELF interpreter: $path"
     version="$(jq -r .version <<<"$info")"
     prefix="$(jq -r .prefix <<<"$info")"
-    floor=${FLOORS[$mm]}
+    floor=${floors[$mm]}
     [[ $(minor "$version") == "$mm" ]] || die 'Cross-minor target refused'
     [[ $(jq -r .kind <<<"$info") == raw ]] || die 'Target must be a raw installation'
     ((10#${version##*.} >= 10#${floor##*.})) || die "Target is below policy floor $floor"
@@ -225,11 +255,13 @@ load_targets() {
 }
 protected() {
   local root
-  for root in /usr /bin /sbin /lib /lib64 /System /opt/codex; do within "$1" "$root" && return 0; done
+  for root in /usr /bin /sbin /lib /lib64 /System "${CODEX_PRIMARY_RUNTIME_ROOT:-}"; do
+    [[ -n $root ]] && within "$1" "$(realpath -m -- "$root")" && return 0
+  done
   return 1
 }
 make_plan() {
-  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch
+  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch outside
   : >"$WORK/plan.ndjson"
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
@@ -240,9 +272,14 @@ make_plan() {
     reason=''
     unresolved='[]'
     flag=0
+    outside=0
     while IFS= read -r -d '' candidate; do
       name=${candidate##*/}
       is_python_name "$name" || continue
+      if [[ -e $candidate ]] && ! scan_path_allowed "$(canonical "$candidate")"; then
+        outside=1
+        continue
+      fi
       if ! is_elf "$candidate"; then
         if is_standard "$name" "$mm"; then flag=1; else unresolved="$(jq -c --arg name "$name" '.+[$name]' <<<"$unresolved")"; fi
       fi
@@ -253,8 +290,8 @@ make_plan() {
       reason='Distribution/runtime-managed prefix'
     elif [[ -L $prefix/bin || -L $prefix/lib ]]; then
       reason='Linked bin/lib subdirectories require a separate rebuild'
-    elif [[ $(jq -r '.referenced_only//false' <<<"$item") == true ]]; then
-      reason='Referenced raw base outside searched trees; add it as a root'
+    elif ((outside)); then
+      reason='Interpreter points outside discovery scope; add its target directory as a root'
     elif [[ $target == null ]]; then
       reason='Target interpreter missing'
     elif [[ $(jq '[.versions[]|split(".")[0:2]|join(".")]|unique|length' <<<"$item") != 1 ]]; then
@@ -348,6 +385,33 @@ choose_binary() {
   done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
   return 1
 }
+# pip uses exit 1 for unsatisfied requirements and writes one issue per line.
+# A timeout, traceback or failed invocation cannot serve as a dependency baseline.
+pip_conflicts() {
+  local binary=$1 output error status=0
+  output="$(mktemp "$WORK/pip.XXXXXX")"
+  error="$output.err"
+  runpy "$binary" -I -m pip check >"$output" 2>"$error" || status=$?
+  if ((status == 0)); then
+    printf '[]\n'
+    return
+  fi
+  if ((status != 1)) || [[ ! -s $output ]] || grep -q '^Traceback' "$error"; then
+    printf 'pip check failed for %s (exit %s)\n' "$binary" "$status" >&2
+    cat "$output" "$error" >&2
+    return 1
+  fi
+  jq -Rn '[inputs | select(length>0)] | unique' <"$output"
+}
+snapshot_packages() {
+  local prefix=$1 destination=$2 binary issues
+  packages "$prefix" "$destination" || return 1
+  if jq -e 'any(.packages[]; .name=="pip")' "$destination" >/dev/null; then
+    binary="$(choose_binary "$prefix")" || return 1
+    issues="$(pip_conflicts "$binary")" || return 1
+    json_edit "$destination" --argjson issues "$issues" '.pip_conflicts=$issues' || return 1
+  fi
+}
 hashes() {
   local prefix=$1 kind=$2 destination=$3 path relative hash name
   : >"$WORK/hashes.ndjson"
@@ -399,7 +463,7 @@ application_checks() {
       ((${#argv[@]})) || return 1
       seconds="$(jq -r '.timeout//120' <<<"$check")"
       [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
-      output="$(cd "$prefix" && timeout --kill-after=5 "$seconds" "${argv[@]}" 2>&1)" || {
+      output="$(cd "$prefix" && timeout --kill-after=5 "$seconds" "${argv[@]}" </dev/null 2>&1)" || {
         printf '%s\n' "$output" >&2
         return 1
       }
@@ -409,7 +473,7 @@ application_checks() {
 }
 validate() {
   local prefix=$1 expected=$2 package_file=$3 manifest=$4 logical=$5 phase=$6 checks=$7 destination=$8
-  local path name info binary mm actual core count=0 unresolved='[]' pip_status='pip absent'
+  local path name info binary mm actual core issues='[]' added count=0 unresolved='[]' pip_status='pip absent'
   mm=$(minor "$expected")
   : >"$WORK/validated.ndjson"
   [[ -z $manifest ]] || check_hashes "$prefix" "$manifest" || return 1
@@ -439,11 +503,14 @@ validate() {
     printf 'Installed package inventory changed: %s\n' "$prefix" >&2
     return 1
   }
-  if jq -e '.packages[]|select(.name=="pip")' "$actual" >/dev/null; then
-    pip_status="$(runpy "$binary" -I -m pip check 2>&1)" || {
-      printf '%s\n' "$pip_status" >&2
+  if jq -e 'any(.packages[]; .name=="pip")' "$actual" >/dev/null; then
+    issues="$(pip_conflicts "$binary")" || return 1
+    added="$(jq -r --argjson current "$issues" '($current - (.pip_conflicts // []))[]' "$package_file")" || return 1
+    if [[ -n $added ]]; then
+      printf 'New pip conflicts in %s:\n%s\n' "$prefix" "$added" >&2
       return 1
-    }
+    fi
+    if [[ $issues == '[]' ]]; then pip_status='No broken requirements found.'; else pip_status='Pre-existing dependency conflicts'; fi
   fi
   core="$(mktemp -d "$WORK/core.XXXXXX")"
   (cd "$core" && runpy "$binary" -I -m pydoc -w ssl sqlite3 bz2 lzma ctypes venv >"$core/imports.log" 2>&1) || {
@@ -456,17 +523,17 @@ validate() {
     return 1
   }; done
   application_checks "$prefix" "$logical" "$binary" "$phase" "$checks" || return 1
-  jq -n --slurpfile interpreters "$WORK/validated.ndjson" --slurpfile packages "$actual" --arg pip_check "$pip_status" --argjson unresolved "$unresolved" \
-    '{interpreters:$interpreters,packages:$packages[0],pip_check:$pip_check,unresolved_aliases:$unresolved,core_modules:["ssl","sqlite3","bz2","lzma","ctypes","venv"]}' >"$destination"
+  jq -n --slurpfile interpreters "$WORK/validated.ndjson" --slurpfile packages "$actual" --arg pip_check "$pip_status" --argjson issues "$issues" --argjson unresolved "$unresolved" \
+    '{interpreters:$interpreters,packages:$packages[0],pip_check:$pip_check,pip_conflicts:$issues,unresolved_aliases:$unresolved,core_modules:["ssl","sqlite3","bz2","lzma","ctypes","venv"]}' >"$destination"
 }
 replace_literal() {
   local file=$1 old=$2 new=$3 temp
   [[ -f $file && ! -L $file ]] || return 0
-  temp="$(mktemp "${file}.rewrite.XXXXXX")"
+  temp="$(mktemp "$WORK/rewrite.XXXXXX")"
   OLD_PREFIX=$old NEW_PREFIX=$new awk 'BEGIN{old=ENVIRON["OLD_PREFIX"];new=ENVIRON["NEW_PREFIX"]}
     {s=$0;out="";while((n=index(s,old))>0){out=out substr(s,1,n-1) new;s=substr(s,n+length(old))}print out s}' "$file" >"$temp"
-  chmod --reference="$file" "$temp"
-  mv -f -- "$temp" "$file"
+  if ! cmp -s -- "$file" "$temp"; then cat "$temp" >"$file"; fi
+  rm -f -- "$temp"
 }
 patch_stage() {
   local entry=$1 stage prefix kind target target_prefix version mm path name base candidate info
@@ -490,13 +557,17 @@ patch_stage() {
     done < <(find "$stage/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
     base="$(jq -r .base_prefix "$entry")"
     candidate=$base/bin/python$mm
-    if info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
+    if [[ $(jq -r '.base_in_scope//false' "$entry") == true ]] && info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
     if awk -F= '$1~/^include-system-site-packages *$/ && $2~/true/ {found=1} END{exit !found}' "$stage/pyvenv.cfg"; then options+=(--system-site-packages); fi
+    # venv rewrites pyvenv.cfg on upgrade. Preserve CPython's verbatim prompt
+    # record (including quotes and escapes) without sourcing or decoding it.
+    awk '/^prompt[[:space:]]*=/{print; exit}' "$stage/pyvenv.cfg" >"$WORK/venv-prompt"
     runpy "$target" -I -m venv --upgrade --without-pip --copies "${options[@]}" "$stage"
     for name in "${names[@]}"; do [[ -f $stage/bin/$name ]] || cp -p --remove-destination -- "$stage/bin/python" "$stage/bin/$name"; done
     replace_literal "$stage/pyvenv.cfg" "$stage" "$prefix"
+    cat "$WORK/venv-prompt" >>"$stage/pyvenv.cfg"
   else
-    rsync -a --checksum --exclude='/bin/***' --exclude='/lib/python*/site-packages/***' --exclude='/lib/python*/dist-packages/***' \
+    rsync -aHAX --modify-window=-1 --exclude='/bin/***' --exclude='/lib/python*/site-packages/***' --exclude='/lib/python*/dist-packages/***' \
       --exclude='/lib64/python*/site-packages/***' "$target_prefix/" "$stage/"
     while IFS= read -r -d '' path; do
       name=${path##*/}
@@ -525,19 +596,20 @@ checkpoint() {
 }
 publish_tree() {
   local source=$1 destination=$2
-  # Preserve the prefix directory; replace changed files and link types through
-  # rsync's temporary-file/rename publication, with checksum-based comparison.
-  rsync -a --checksum --delete "$source/" "$destination/"
+  shift 2
+  rsync -aHAX --modify-window=-1 --delete "$@" -- "$source/" "$destination/"
   sync -f "$destination"
 }
 restore_one() {
   local entry=$1 journal=$2 prefix backup identity
+  jq -e '.publication_started == true' "$entry" >/dev/null || die 'No publication started; backup is not restorable'
   prefix="$(jq -r .prefix "$entry")"
   backup="$(jq -r .backup "$entry")"
-  [[ -d $backup && ! -L $prefix && -d $prefix ]] || die 'Rollback requires the original prefix and its backup'
+  [[ -d $backup && ! -L $backup && ! -L $prefix && -d $prefix ]] || die 'Rollback requires the original prefix and its backup'
   identity="$(stat -Lc '%d:%i' -- "$prefix")"
   [[ $identity == "$(jq -r .identity "$entry")" ]] || die "Rollback prefix identity changed: $prefix"
-  publish_tree "$backup" "$prefix"
+  # A failed publish may leave equal-sized files with the same timestamps.
+  publish_tree "$backup" "$prefix" --ignore-times
   checkpoint "$entry" "$journal" --arg at "$(now)" '.status="rolled_back"|.rolled_back_at=$at'
   event rolled_back "$prefix"
 }
@@ -582,15 +654,15 @@ apply_one() {
   checkpoint "$entry" "$journal" --slurpfile hashes "$manifest" --slurpfile result "$result" '.runtime_hashes=$hashes[0]|.staged_validation=$result[0]|.status="prepared"'
   [[ $(stat -Lc '%d:%i' -- "$prefix") == "$identity" ]]
   cp -a --reflink=never -- "$prefix" "$backup"
+  sync -f "$backup"
   checkpoint "$entry" "$journal" '.status="backed_up"|.publication_started=true'
   publish_tree "$stage" "$prefix"
   checkpoint "$entry" "$journal" '.status="installed"'
   result="$WORK/final-validation.json"
   validate "$prefix" "$version" "$packages_file" "$manifest" "$prefix" final "$checks" "$result"
   checkpoint "$entry" "$journal" --slurpfile result "$result" --arg at "$(now)" '.validation=$result[0]|.status="verified"|.finished=$at'
-  # Retain the staged tree with the backup until the owner removes the journal's
-  # recovery artifacts. Verification must never depend on cleanup timing.
   trap - ERR INT TERM
+  rm -rf -- "$stage" || printf 'Stage cleanup failed: %s\n' "$stage" >&2
   event verified "$prefix" "$version"
 }
 acquire_locks() {
@@ -606,8 +678,8 @@ rollback_entries() {
   while IFS= read -r entry; do
     status="$(jq -r .status <<<"$entry")"
     path="$(jq -r .entry_file <<<"$entry")"
-    case "$status" in verified | installed | backed_up | prepared | rollback_failed)
-      if [[ -d $(jq -r .backup <<<"$entry") ]]; then bash "$SELF" _restore "$path" "$journal" || failed=1; fi
+    case "$status" in verified | installed | backed_up | failed | rollback_failed)
+      if jq -e '.publication_started == true' <<<"$entry" >/dev/null; then bash "$SELF" _restore "$path" "$journal" || failed=1; fi
       ;;
     esac
   done < <(jq -c '.entries|reverse[]' "$journal")
@@ -632,7 +704,7 @@ apply_plan() {
     }
     prefix="$(jq -r .prefix <<<"$item")"
     snapshot="$(mktemp "$WORK/snapshot.XXXXXX")"
-    if packages "$prefix" "$snapshot" 2>"$WORK/snapshot-error"; then
+    if snapshot_packages "$prefix" "$snapshot" 2>"$WORK/snapshot-error"; then
       jq -c --slurpfile snapshot "$snapshot" '.+{package_snapshot:$snapshot[0]}' <<<"$item" >>"$WORK/prepared-plan.ndjson"
     else
       failed=$((failed + 1))
@@ -659,7 +731,7 @@ apply_plan() {
     path="$journal.entries/$count.json"
     jq --arg stage "$stage" --arg backup "$backup" --arg entry_file "$path" '.+{stage:$stage,backup:$backup,entry_file:$entry_file,status:"pending",old_version:.version}' <<<"$item" | atomic_write "$path"
     json_edit "$journal" --slurpfile entry "$path" '.entries += [$entry[0]]'
-    if ! bash "$SELF" _apply-one "$path" "$journal" "$CHECKS"; then
+    if ! bash "$SELF" _apply-one "$path" "$journal" "$CHECKS" </dev/null; then
       failed=$((failed + 1))
       fatal=1
       rollback_entries "$journal" || failed=$((failed + 1))
