@@ -76,6 +76,8 @@ Multi-version Python installer:
 - Installs dependencies via apt (unless `--skip-apt`)
 - Defaults to 3.11 and 3.13; use `--py` for explicit branch selection. Python 3.8 and 3.10 are end-of-life.
 - `update_python_envs.sh` scans, plans, applies, verifies, and rolls back private CPython patch updates.
+- Apply confirms each venv with `y`/`Y`; `-Y` bypasses prompts. Process logs default to `log/<UTC timestamp>.<suffix>/process.log` beside the updater; `--log-dir` changes the root.
+- Keep recovery files outside updated prefixes. Linked `pyvenv.cfg` files are skipped to protect shared configuration.
 - Both environment scripts use native Bash/Unix utilities; do not embed Python source or a Python control engine in the `.sh` files.
 - Creates version-specific entry points in `<BASE_DIR>/bin/` (py38, py10, py11, py13)
 - Optionally modifies `~/.bashrc` to add BASE_DIR to PATH (unless `--no-bashrc`)

@@ -9,7 +9,7 @@ modules (`sysconfig`, `venv`, `pip`, and `pydoc`).
 
 ## Requirements and scope
 
-Use Bash 4+, GNU findutils/coreutils, awk, jq, rsync, and util-linux `flock`.
+Use Bash 4+, GNU findutils/coreutils (including `tee`), awk, jq, rsync, and util-linux `flock`.
 Use trusted roots owned by the invoking account: discovery executes candidate
 interpreters. Run without sudo. Host-root execution is rejected; a disposable
 container with the sole UID mapping `0 0 1` is the test exception.
@@ -30,7 +30,9 @@ being inspected. `python -I -m sysconfig` supplies the identity and ABI.
 Updates preserve the Python minor branch, installed package versions, console
 scripts, and activation paths. The tool rejects downgrades and ABI mismatches;
 it skips distribution/runtime-managed prefixes, Conda prefixes/package caches,
-shared raw builds, and prefixes with linked `bin` or `lib` subdirectories.
+shared raw builds, and prefixes with linked `bin`, `lib`, or `pyvenv.cfg`.
+Linked `pyvenv.cfg` files require a separate rebuild: staging must not write
+through a configuration link to the live environment or a shared file.
 System directories and the runtime tree named by `CODEX_PRIMARY_RUNTIME_ROOT`
 are protected. Use `--exclude` for other managed installations. Conda needs its
 own solver. Legacy or unusable environments need a rebuild.
@@ -99,6 +101,32 @@ bash update_python_envs.sh verify update-journal.json \
 bash update_python_envs.sh rollback update-journal.json
 ```
 
+Apply requires a separate `y` or `Y` for every venv selected for updating. Each
+prompt shows its path and old/target versions. Enter, `n`, or any other response
+skips that venv. End-of-input aborts the apply before any environment is changed,
+including when earlier prompts received `y`. Responses come from the original
+standard input; workers and application checks continue to receive EOF.
+
+All venv confirmations are collected before updating raw bases. A skipped venv
+blocks an update to its discovered raw base, so declining it cannot change its
+runtime indirectly. Approved peers can use the separate patch target instead.
+Raw installations do not receive a separate prompt. Roots and exclusions define
+discovery scope; dependent environments outside that scope are not prompted.
+
+Use `-Y` for unattended updates. The option is accepted before or after `apply`:
+
+```bash
+bash update_python_envs.sh -Y apply /path/to/projects /path/to/raw-installs \
+  --target 3.11=/path/to/patched-runtimes/opt/python-3.11.18/bin/python3.11 \
+  --output update-journal.json
+```
+
+Keep the journal, its `.entries` directory, the post-verification output and
+the process log outside every prefix selected for updating. Apply rejects
+overlapping paths before creating the journal or changing environments, including
+paths reached through directory symlinks. Verification rejects missing or empty
+runtime hash manifests rather than treating them as a successful integrity check.
+
 `--checks` is optional. JSON keys are absolute-prefix glob patterns; values are
 lists of argument arrays. Commands run without an implicit shell. `{python}`
 expands to the environment's Python binary; `{prefix}` expands to the current
@@ -143,6 +171,34 @@ compatible. The locks prevent concurrent updater instances in the same parent
 directories. Interrupted operations require journal review and rollback before
 applications restart.
 
+## Process logs
+
+The JSON journal remains the recovery record. Each public command (`scan`,
+`plan`, `apply`, `verify`, `rollback`) also creates an independent text log at:
+
+```text
+<repository>/log/<UTC timestamp>.<unique suffix>/process.log
+```
+
+The root is next to `update_python_envs.sh`, regardless of the working directory.
+For example, `log/20261111T090000Z.ABC123/process.log`. The suffix prevents
+collisions when commands start in the same second. The run directory uses mode
+700 and the log uses mode 600. `/log/` is ignored by Git.
+
+The log preserves stdout and stderr while keeping both visible on their original
+terminal streams. It records the invocation, confirmations and skips, update
+stages, application-check output, validation failures, rollbacks, and final exit
+code. The command waits for the log writers before returning. Apply workers and
+the final batch verification share the outer log. An explicit later verification
+or rollback starts a new log. The journal's `log_file` field locates its apply log.
+
+Discovery and planning snapshots are saved alongside `process.log` as
+`inventory.json` and `plan.json`; apply also saves `approved-plan.json` with the
+confirmation decisions. Use `--log-dir /path/to/logs` to choose another log root;
+the timestamp directory is created beneath it. A writable log destination is
+required before the operation starts. Logs inside a prefix selected for updating
+are rejected. Argument-parsing and missing-tool errors occur before log setup.
+
 ## Validation
 
 The Bash regression suite takes two private interpreter binaries from the same
@@ -153,6 +209,14 @@ with a missing module. It requires `setfacl`, `getfacl`, `setfattr`, and
 ```bash
 bash tests/python-updater.bash /path/to/old/bin/python3.11 /path/to/patched/bin/python3.11
 ```
+
+The suite includes `tests/python-updater-controls.bash`, which can also run with
+the same two interpreter arguments. It covers journal placement through physical
+and linked paths, linked configuration preservation, affirmative/negative/empty
+responses, EOF before publication, `-Y`, protection of declined venvs' raw bases,
+hash-manifest rejection, explicit and automatic rollback, and log contents,
+location, permissions, and exit status. These tests are local regression commands;
+this change does not modify CI/CD configuration.
 
 ### November 8 review and compatibility tests
 

@@ -87,7 +87,7 @@ exec "$TEST_CP" "$@"
 WRAPPER
 chmod +x "$lab/tools/cp"
 printf 'must survive\n' >"$a/sentinel"
-bad env PATH="$lab/tools:$PATH" bash "$updater" apply "$a" "${target_arg[@]}" --output "$lab/interrupted"
+bad env PATH="$lab/tools:$PATH" bash "$updater" apply -Y "$a" "${target_arg[@]}" --output "$lab/interrupted"
 jq -e '.entries[0]|.status=="prepared" and (.publication_started!=true)' "$lab/interrupted" >/dev/null
 run rollback "$lab/interrupted"
 bad run _restore "$lab/interrupted.entries/1.json" "$lab/interrupted"
@@ -109,7 +109,7 @@ check_metadata() {
   [[ $a/sentinel -ef $a/linked-sentinel ]]
 }
 jq -n '{"*":[{"argv":["bash","-c","cat >/dev/null; test \"$(readlink /proc/self/fd/0)\" = /dev/null"]},{"argv":["true"]}]}' >"$lab/checks"
-run apply "$root" "${target_arg[@]}" --checks "$lab/checks" --output "$journal"
+run apply -Y "$root" "${target_arg[@]}" --checks "$lab/checks" --output "$journal"
 jq -e '.failures==0 and (.entries|length)==2 and all(.entries[];.status=="verified")' "$journal" >/dev/null
 jq -e --arg p "$a" '.entries[]|select(.prefix==$p)|(.package_snapshot.pip_conflicts|length)==1 and (.validation.pip_conflicts==.package_snapshot.pip_conflicts)' "$journal" >/dev/null
 while IFS= read -r stage; do [[ ! -e $stage ]]; done < <(jq -r '.entries[].stage' "$journal")
@@ -155,3 +155,4 @@ printf 'printf "%%s\\\\n" %s\n' "$minor.$((${v##*.} + 1))" >"$lab/policy/install
 bad bash "$lab/policy/update_python_envs.sh" plan "$a" "${target_arg[@]}" --output "$lab/below" 2>"$lab/policy-error"
 grep -F 'below policy floor' "$lab/policy-error" >/dev/null
 echo 'PASS: discovery scope, interrupted backup, dependency baseline, prompt, module errors, filesystem metadata, cleanup, stdin and shared policy'
+bash "${updater%/*}/tests/python-updater-controls.bash" "$old" "$target"

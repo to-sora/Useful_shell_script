@@ -8,25 +8,69 @@ SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
 MARKER='.pyenv-update-'
 WORK=''
 declare -a ROOTS=() EXCLUDES=() SCAN_ROOTS=() SCAN_EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
+declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
+ASSUME_YES=0
+LOG_ROOT="${SELF%/*}/log"
+LOG_DIR='' LOG_FILE='' LOGGING=0
+LOG_STDOUT_FD='' LOG_STDERR_FD='' LOG_STDOUT_PID='' LOG_STDERR_PID=''
 declare -A EOL=([3.8]=2024-10-07 [3.9]=2025-10-31 [3.10]=2026-10-01)
 die() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 2
 }
 now() { date -u +%FT%TZ; }
-cleanup() { [[ -z "$WORK" ]] || rm -rf -- "$WORK"; }
+cleanup() {
+  local status=$? pid
+  trap - EXIT
+  if ((LOGGING)); then
+    printf '[%s] Finished %s (exit %s)\n' "$(now)" "$COMMAND" "$status" >&2
+    # Close both writers before waiting, so the log is complete on return.
+    exec 1>&"$LOG_STDOUT_FD" 2>&"$LOG_STDERR_FD"
+    exec {LOG_STDOUT_FD}>&- {LOG_STDERR_FD}>&-
+    for pid in "$LOG_STDOUT_PID" "$LOG_STDERR_PID"; do
+      if ! wait "$pid"; then
+        printf 'ERROR: Could not finish writing %s\n' "$LOG_FILE" >&2
+        [[ $status != 0 ]] || status=1
+      fi
+    done
+    if ! sync -d "$LOG_FILE"; then [[ $status != 0 ]] || status=1; fi
+  fi
+  [[ -z "$WORK" ]] || rm -rf -- "$WORK"
+  exit "$status"
+}
 trap cleanup EXIT
+start_logging() {
+  LOG_ROOT="$(realpath -m -- "$LOG_ROOT")"
+  mkdir -p -- "$LOG_ROOT"
+  LOG_DIR="$(mktemp -d "$LOG_ROOT/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  LOG_FILE="$LOG_DIR/process.log"
+  : >"$LOG_FILE"
+  exec {LOG_STDOUT_FD}>&1 {LOG_STDERR_FD}>&2
+  exec > >(tee -a -- "$LOG_FILE")
+  LOG_STDOUT_PID=$!
+  exec 2> >(tee -a -- "$LOG_FILE" >&2)
+  LOG_STDERR_PID=$!
+  LOGGING=1
+  printf 'Log: %s\n[%s] Command:' "$LOG_FILE" "$(now)" >&2
+  printf ' %q' "$SELF" "${INVOCATION[@]}" >&2
+  printf '\n' >&2
+}
 usage() {
   cat <<'HELP'
 Usage:
   update_python_envs.sh scan ROOT... --output inventory.json
   update_python_envs.sh plan ROOT... --target MINOR=/patched/bin/python --output plan.json
-  update_python_envs.sh apply ROOT... --target MINOR=/patched/bin/python --output journal.json
+  update_python_envs.sh [-Y] apply ROOT... --target MINOR=/patched/bin/python --output journal.json
   update_python_envs.sh verify JOURNAL --output verification.json
   update_python_envs.sh rollback JOURNAL
 
-Options: --exclude PATH (repeatable), --checks checks.json (apply/verify).
+Options: --exclude PATH (repeatable), --checks checks.json (apply/verify),
+         --log-dir DIR (default: script directory/log).
+Apply asks for y/Y for each venv before changing any environment; other answers
+skip it. EOF aborts before updating. -Y before or after apply bypasses prompts.
+Each public command writes DIR/<UTC timestamp>.<unique suffix>/process.log.
+Journal, journal.entries and logs must be outside the updated prefixes.
 Discovery probes interpreter binaries within the supplied roots. Supply the
 linked directory or interpreter base as another root to include an external target.
 All control flow, discovery, JSON, copying, validation, and recovery use Bash and
@@ -37,7 +81,7 @@ HELP
 require_tools() {
   local tool
   [[ ${BASH_VERSINFO[0]} -ge 4 ]] || die 'Bash 4 or newer is required'
-  for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od; do
+  for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od tee; do
     command -v "$tool" >/dev/null || die "Required utility missing: $tool"
   done
 }
@@ -58,6 +102,19 @@ canonical() {
   realpath -e -- "$1"
 }
 within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
+assert_control_paths() {
+  local prefixes=$1 path resolved prefix
+  shift
+  for path in "$@"; do
+    [[ -n $path ]] || continue
+    resolved="$(realpath -m -- "$path")"
+    while IFS= read -r prefix; do
+      if within "$resolved" "$prefix"; then
+        die "Control path must be outside updated prefixes: $path overlaps $prefix"
+      fi
+    done < <(jq -r '.[].prefix' "$prefixes")
+  done
+}
 stable_version() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 minor() { printf '%s\n' "${1%.*}"; }
 is_python_name() { [[ $1 =~ ^python([0-9]+(\.[0-9]+)*)?$ ]]; }
@@ -128,7 +185,7 @@ json_edit() {
   atomic_write "$destination" <"$temp"
   rm -f -- "$temp"
 }
-event() { jq -cn --arg event "$1" --arg prefix "${2:-}" --arg detail "${3:-}" '{event:$event,prefix:$prefix,detail:$detail}'; }
+event() { jq -cn --arg time "$(now)" --arg event "$1" --arg prefix "${2:-}" --arg detail "${3:-}" '{time:$time,event:$event,prefix:$prefix,detail:$detail}'; }
 warning() { jq -cn --arg path "$1" --arg reason "$2" '{path:$path,reason:$reason}' >>"$WORK/warnings.ndjson"; }
 scan_path_allowed() {
   local path=$1 root
@@ -290,6 +347,8 @@ make_plan() {
       reason='Distribution/runtime-managed prefix'
     elif [[ -L $prefix/bin || -L $prefix/lib ]]; then
       reason='Linked bin/lib subdirectories require a separate rebuild'
+    elif [[ -L $prefix/pyvenv.cfg ]]; then
+      reason='Linked pyvenv.cfg requires a separate rebuild'
     elif ((outside)); then
       reason='Interpreter points outside discovery scope; add its target directory as a root'
     elif [[ $target == null ]]; then
@@ -317,6 +376,58 @@ make_plan() {
   done < <(jq -c '.environments[]' "$inventory")
   jq -n --slurpfile inventory "$inventory" --slurpfile plan "$WORK/plan.ndjson" \
     '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
+}
+
+confirm_plan() {
+  local plan=$1 destination=$2 item prefix answer input_fd base
+  local -A blocked=()
+  : >"$WORK/confirmed.ndjson"
+  # Keep responses separate from the JSON stream used by the loop.
+  exec {input_fd}<&0
+  while IFS= read -r item; do
+    if [[ $(jq -r .kind <<<"$item") == venv ]]; then
+      prefix="$(jq -r .prefix <<<"$item")"
+      if [[ $(jq -r .action <<<"$item") == update ]]; then
+        if ((ASSUME_YES)); then
+          item="$(jq -c '.approval="bypassed"' <<<"$item")"
+          event confirmation "$prefix" 'bypassed (-Y)'
+        else
+          printf 'Update venv %s (%s -> %s)? [y/N] ' "$prefix" \
+            "$(jq -r .version <<<"$item")" "$(jq -r .target.version <<<"$item")" >&2
+          if ! IFS= read -r -u "$input_fd" answer; then
+            printf '\n' >&2
+            die 'Confirmation input ended; no environments updated. Use -Y for unattended apply.'
+          fi
+          printf '\n' >&2
+          case "$answer" in
+            y | Y)
+              item="$(jq -c '.approval="confirmed"' <<<"$item")"
+              event confirmation "$prefix" 'approved'
+              ;;
+            *)
+              item="$(jq -c '.action="skip"|.reason="Venv update declined"|.approval="declined"' <<<"$item")"
+              event confirmation "$prefix" 'declined'
+              ;;
+          esac
+        fi
+      fi
+      if [[ $(jq -r .action <<<"$item") == skip ]]; then
+        base="$(jq -r .base_prefix <<<"$item")"
+        blocked[$base]=1
+      fi
+    fi
+    printf '%s\n' "$item" >>"$WORK/confirmed.ndjson"
+  done < <(jq -c '.plan[]' "$plan")
+  exec {input_fd}<&-
+  : >"$WORK/approved.ndjson"
+  while IFS= read -r item; do
+    prefix="$(jq -r .prefix <<<"$item")"
+    if [[ $(jq -r .kind <<<"$item") == raw && $(jq -r .action <<<"$item") == update && ${blocked[$prefix]+yes} ]]; then
+      item="$(jq -c '.action="skip"|.reason="Dependent venv is skipped; raw base left unchanged"' <<<"$item")"
+    fi
+    printf '%s\n' "$item" >>"$WORK/approved.ndjson"
+  done <"$WORK/confirmed.ndjson"
+  jq --slurpfile approved "$WORK/approved.ndjson" '.plan=$approved' "$plan" | atomic_write "$destination"
 }
 
 # Read installed distribution records with awk/jq, including inherited packages.
@@ -431,6 +542,11 @@ hashes() {
 }
 check_hashes() {
   local prefix=$1 manifest=$2 record path expected actual
+  jq -e 'type=="array" and length>0 and all(.[];
+    (.path|type=="string") and (.sha256|type=="string"))' "$manifest" >/dev/null || {
+    printf 'Missing or invalid runtime hash manifest: %s\n' "$prefix" >&2
+    return 1
+  }
   while IFS= read -r record; do
     path="$(jq -r .path <<<"$record")"
     expected="$(jq -r .sha256 <<<"$record")"
@@ -463,10 +579,12 @@ application_checks() {
       ((${#argv[@]})) || return 1
       seconds="$(jq -r '.timeout//120' <<<"$check")"
       [[ $seconds =~ ^[1-9][0-9]*$ ]] || return 1
+      event application_check "$logical" "$phase: ${argv[0]}"
       output="$(cd "$prefix" && timeout --kill-after=5 "$seconds" "${argv[@]}" </dev/null 2>&1)" || {
         printf '%s\n' "$output" >&2
         return 1
       }
+      [[ -z $output ]] || printf '%s\n' "$output" >&2
       if [[ $(jq -r '.contains//""' <<<"$check") != '' ]]; then [[ $output == *"$(jq -r .contains <<<"$check")"* ]] || return 1; fi
     done < <(jq -c --arg pattern "$pattern" '.[$pattern][]' "$config")
   done < <(jq -r 'keys[]' "$config")
@@ -546,7 +664,7 @@ patch_stage() {
   version="$(jq -r .target.version "$entry")"
   mm=$(minor "$version")
   if [[ $kind == venv ]]; then
-    [[ -f $stage/pyvenv.cfg ]] || die 'Legacy venv has no pyvenv.cfg; rebuild required'
+    [[ -f $stage/pyvenv.cfg && ! -L $stage/pyvenv.cfg ]] || die 'Venv requires a regular pyvenv.cfg; rebuild required'
     while IFS= read -r -d '' path; do
       name=${path##*/}
       is_python_name "$name" || continue
@@ -635,6 +753,7 @@ apply_one() {
   kind="$(jq -r .kind "$entry")"
   version="$(jq -r .target.version "$entry")"
   [[ ! -L $prefix && -d $prefix && ! -e $stage && ! -e $backup ]]
+  [[ ! -L $prefix/pyvenv.cfg ]] || die 'Linked pyvenv.cfg requires a separate rebuild'
   [[ $(stat -Lc %u -- "$prefix") == "$EUID" ]]
   identity="$(stat -Lc '%d:%i' -- "$prefix")"
   available="$(df -PB1 -- "$prefix" | awk 'NR==2 {print $4}')"
@@ -644,21 +763,26 @@ apply_one() {
   checkpoint "$entry" "$journal" --arg identity "$identity" '.identity=$identity|.status="preparing"'
   event prepare "$prefix" "$version"
   cp -a --reflink=never -- "$prefix" "$stage"
+  event patch_stage "$prefix" "$stage"
   patch_stage "$entry"
   packages_file="$WORK/expected-packages.json"
   jq .package_snapshot "$entry" >"$packages_file"
   result="$WORK/staged-validation.json"
+  event validate_stage "$prefix"
   validate "$stage" "$version" "$packages_file" '' "$prefix" stage "$checks" "$result"
   manifest="$WORK/runtime-hashes.json"
   hashes "$stage" "$kind" "$manifest"
   checkpoint "$entry" "$journal" --slurpfile hashes "$manifest" --slurpfile result "$result" '.runtime_hashes=$hashes[0]|.staged_validation=$result[0]|.status="prepared"'
   [[ $(stat -Lc '%d:%i' -- "$prefix") == "$identity" ]]
+  event backup "$prefix" "$backup"
   cp -a --reflink=never -- "$prefix" "$backup"
   sync -f "$backup"
   checkpoint "$entry" "$journal" '.status="backed_up"|.publication_started=true'
+  event publish "$prefix"
   publish_tree "$stage" "$prefix"
   checkpoint "$entry" "$journal" '.status="installed"'
   result="$WORK/final-validation.json"
+  event validate_final "$prefix"
   validate "$prefix" "$version" "$packages_file" "$manifest" "$prefix" final "$checks" "$result"
   checkpoint "$entry" "$journal" --slurpfile result "$result" --arg at "$(now)" '.validation=$result[0]|.status="verified"|.finished=$at'
   trap - ERR INT TERM
@@ -688,12 +812,16 @@ rollback_entries() {
 apply_plan() {
   local plan=$1 journal=$2 item prefix snapshot path token stage backup count=0 failed=0 fatal=0 base
   local -A blocked=()
-  [[ ! -e $journal && ! -e $journal.entries ]] || die 'Journal exists; choose a new output path'
-  mkdir -p -- "$journal.entries"
+  [[ ! -e $journal && ! -L $journal && ! -e $journal.entries && ! -L $journal.entries ]] || die 'Journal exists; choose a new output path'
   jq '[.plan[]|select(.action=="update")]' "$plan" >"$WORK/lock-list.json"
+  assert_control_paths "$WORK/lock-list.json" "$journal" "$journal.entries" "$journal.post-verify.json" "$LOG_DIR" "$WORK"
   acquire_locks "$WORK/lock-list.json"
-  jq -n --arg created "$(now)" --arg path "$journal" --slurpfile plan "$plan" \
-    '{schema:2,engine:"bash",created:$created,path:$path,complete:false,failures:0,entries:[],failed_snapshots:[],
+  confirm_plan "$plan" "$WORK/confirmed-plan.json"
+  plan="$WORK/confirmed-plan.json"
+  cp -- "$plan" "$LOG_DIR/approved-plan.json"
+  mkdir -p -- "$journal.entries"
+  jq -n --arg created "$(now)" --arg path "$journal" --arg log_file "$LOG_FILE" --slurpfile plan "$plan" \
+    '{schema:2,engine:"bash",created:$created,path:$path,log_file:$log_file,complete:false,failures:0,entries:[],failed_snapshots:[],
       skipped:[$plan[0].plan[]|select(.action=="skip")|{prefix,version,reason}],
       end_of_support:[$plan[0].plan[]|select(.eol!="")|{prefix,version,eol}],discovery_warnings:$plan[0].inventory.warnings}' | atomic_write "$journal"
   : >"$WORK/prepared-plan.ndjson"
@@ -703,11 +831,13 @@ apply_plan() {
       continue
     }
     prefix="$(jq -r .prefix <<<"$item")"
+    event snapshot "$prefix"
     snapshot="$(mktemp "$WORK/snapshot.XXXXXX")"
     if snapshot_packages "$prefix" "$snapshot" 2>"$WORK/snapshot-error"; then
       jq -c --slurpfile snapshot "$snapshot" '.+{package_snapshot:$snapshot[0]}' <<<"$item" >>"$WORK/prepared-plan.ndjson"
     else
       failed=$((failed + 1))
+      cat "$WORK/snapshot-error" >&2
       base="$(jq -r .base_prefix <<<"$item")"
       [[ $(jq -r .kind <<<"$item") != venv ]] || blocked[$base]=1
       json_edit "$journal" --arg prefix "$prefix" --arg error "$(cat "$WORK/snapshot-error")" '.failed_snapshots += [{prefix:$prefix,error:$error}]'
@@ -740,9 +870,7 @@ apply_plan() {
   done <"$WORK/prepared-plan.ndjson"
   json_edit "$journal" --argjson failures "$failed" --arg finished "$(now)" '.complete=true|.finished=$finished|.failures=$failures'
   if ((fatal == 0)); then
-    local -a verify_args=(verify "$journal" --output "$journal.post-verify.json")
-    [[ -z $CHECKS ]] || verify_args+=(--checks "$CHECKS")
-    if ! bash "$SELF" "${verify_args[@]}"; then
+    if ! bash "$SELF" _verify "$journal" "$journal.post-verify.json" "$CHECKS"; then
       if [[ ! -s $journal.post-verify.json ]] || jq -e '.results[]|select(.passed==false and .snapshot_failed!=true)' "$journal.post-verify.json" >/dev/null; then rollback_entries "$journal" || true; fi
       failed=$((failed + 1))
       json_edit "$journal" --argjson failures "$failed" '.failures=$failures'
@@ -773,6 +901,7 @@ verify_journal() {
       jq -cn --arg prefix "$prefix" --slurpfile validation "$result" '{prefix:$prefix,passed:true,validation:$validation[0]}' >>"$WORK/verification.ndjson"
     else
       failed=$((failed + 1))
+      cat "$WORK/verify-error" >&2
       jq -cn --arg prefix "$prefix" --arg error "$(cat "$WORK/verify-error")" '{prefix:$prefix,passed:false,error:$error}' >>"$WORK/verification.ndjson"
     fi
   done < <(jq -c '.entries[]' "$journal")
@@ -783,6 +912,7 @@ verify_journal() {
 main() {
   require_tools
   WORK="$(mktemp -d)"
+  while [[ ${1:-} == -Y ]]; do ASSUME_YES=1; shift; done
   COMMAND=${1:---help}
   shift || true
   case "$COMMAND" in
@@ -800,6 +930,12 @@ main() {
       restore_one "$@"
       return
       ;;
+    _verify)
+      root_guard
+      CHECKS=$3
+      verify_journal "$1" "$2"
+      return
+      ;;
     scan | plan | apply) ;;
     verify | rollback)
       (($#)) || die 'Journal path required'
@@ -814,15 +950,20 @@ main() {
   root_guard
   while (($#)); do
     case "$1" in
-      --output | --checks | --exclude | --target)
+      --output | --checks | --exclude | --target | --log-dir)
         (($# >= 2)) || die "Missing value for $1"
         case "$1" in
           --output) OUTPUT="$(absolute "$2")" ;;
           --checks) CHECKS="$(canonical "$2")" ;;
           --exclude) EXCLUDES+=("$(absolute "$2")") ;;
           --target) TARGET_SPECS+=("$2") ;;
+          --log-dir) LOG_ROOT="$(absolute "$2")" ;;
         esac
         shift 2
+        ;;
+      -Y)
+        ASSUME_YES=1
+        shift
         ;;
       --)
         shift
@@ -836,6 +977,8 @@ main() {
         ;;
     esac
   done
+  start_logging
+  ((ASSUME_YES == 0)) || [[ $COMMAND == apply ]] || die '-Y is only supported by apply'
   if [[ -n $CHECKS ]]; then jq -e 'type=="object" and all(.[];type=="array" and all(.[];.argv|type=="array" and length>0 and all(.[];type=="string")))' "$CHECKS" >/dev/null || die 'Invalid application checks JSON'; fi
   if [[ -n $JOURNAL ]]; then
     jq -e '.schema==2 and .engine=="bash" and (.entries|type=="array")' "$JOURNAL" >/dev/null || die 'Expected a native Bash schema-2 journal'
@@ -848,16 +991,19 @@ main() {
         ((${#TARGET_SPECS[@]})) || die '--target is required'
         load_targets
       fi
+      event scan_started
       scan "$WORK/inventory.json"
+      cp -- "$WORK/inventory.json" "$LOG_DIR/inventory.json"
       if [[ $COMMAND == scan ]]; then
         atomic_write "$OUTPUT" <"$WORK/inventory.json"
         event scanned '' "$(jq '.environments|length' "$OUTPUT") environments"
         return
       fi
       make_plan "$WORK/inventory.json" "$WORK/plan.json"
+      cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
+      event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$WORK/plan.json") updates"
       if [[ $COMMAND == plan ]]; then
         atomic_write "$OUTPUT" <"$WORK/plan.json"
-        event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$OUTPUT") updates"
         return
       fi
       apply_plan "$WORK/plan.json" "$OUTPUT"
@@ -868,6 +1014,7 @@ main() {
       ;;
     rollback)
       jq .entries "$JOURNAL" >"$WORK/lock-list.json"
+      assert_control_paths "$WORK/lock-list.json" "$JOURNAL" "$JOURNAL.entries" "$LOG_DIR" "$WORK"
       acquire_locks "$WORK/lock-list.json"
       rollback_entries "$JOURNAL"
       ;;
