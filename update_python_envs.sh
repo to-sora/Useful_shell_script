@@ -8,9 +8,14 @@ SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
 MARKER='.pyenv-update-'
 WORK=''
 declare -a ROOTS=() EXCLUDES=() SCAN_ROOTS=() SCAN_EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
+declare -a PRUNE_PATHS=() TRUSTED_TARGETS=()
 declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
 ASSUME_YES=0
+RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater"
+BUILD_JOBS=4
+SKIP_APT=0 NO_SUDO=0
+declare -A POLICY=()
 LOG_ROOT="${SELF%/*}/log"
 LOG_DIR='' LOG_FILE='' LOGGING=0
 LOG_STDOUT_FD='' LOG_STDERR_FD='' LOG_STDOUT_PID='' LOG_STDERR_PID=''
@@ -59,14 +64,23 @@ start_logging() {
 usage() {
   cat <<'HELP'
 Usage:
-  update_python_envs.sh scan ROOT... --output inventory.json
-  update_python_envs.sh plan ROOT... --target MINOR=/patched/bin/python --output plan.json
-  update_python_envs.sh [-Y] apply ROOT... --target MINOR=/patched/bin/python --output journal.json
-  update_python_envs.sh verify JOURNAL --output verification.json
+  update_python_envs.sh scan [ROOT...]
+  update_python_envs.sh plan [ROOT...]
+  update_python_envs.sh [-Y] apply [ROOT...]
+  update_python_envs.sh verify JOURNAL
   update_python_envs.sh rollback JOURNAL
 
-Options: --exclude PATH (repeatable), --checks checks.json (apply/verify),
-         --log-dir DIR (default: script directory/log).
+Roots default to HOME. Plan/apply use the adjacent installer's release pins.
+Apply reuses healthy targets or builds missing branches, then updates environments.
+Plan reports required builds without installing. Installer --print-pins lists versions.
+Options: --target MINOR=/existing/bin/python (repeatable override),
+         --output FILE (default: JSON inside the run's log directory),
+         --exclude PATH (repeatable), --checks checks.json (apply/verify),
+         --log-dir DIR (default: script directory/log),
+         --runtime-dir DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater),
+         --jobs N (default: 4), --skip-apt, --no-sudo (implies --skip-apt).
+Automatic builds use install_python.sh with --skip-conda and --no-bashrc.
+Ubuntu dependency installation and builds may request a sudo password.
 Apply asks for y/Y for each venv before changing any environment; other answers
 skip it. EOF aborts before updating. -Y before or after apply bypasses prompts.
 Each public command writes DIR/<UTC timestamp>.<unique suffix>/process.log.
@@ -84,6 +98,20 @@ require_tools() {
   for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od tee; do
     command -v "$tool" >/dev/null || die "Required utility missing: $tool"
   done
+}
+prepare_tools() {
+  local tool os
+  local -a missing=()
+  for tool in jq rsync; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+  if ((${#missing[@]})) && [[ $COMMAND == apply ]] && ((SKIP_APT == 0)); then
+    os="$(. /etc/os-release && printf '%s' "$ID")"
+    [[ $os == ubuntu ]] || die "Install required utilities: ${missing[*]}"
+    command -v sudo >/dev/null || die "Install required utilities: ${missing[*]} (sudo unavailable)"
+    printf 'Installing updater dependencies: %s\n' "${missing[*]}" >&2
+    sudo apt-get update </dev/null
+    sudo apt-get install -y "${missing[@]}" </dev/null
+  fi
+  require_tools
 }
 root_guard() {
   if [[ $EUID -eq 0 ]]; then
@@ -192,6 +220,8 @@ scan_path_allowed() {
   case "/${path#/}/" in */.git/* | */node_modules/* | *"$MARKER"*) return 1 ;; esac
   for root in "${SCAN_EXCLUDES[@]}"; do within "$path" "$root" && return 1; done
   for root in "${SCAN_ROOTS[@]}"; do within "$path" "$root" && return 0; done
+  # Validated, explicitly supplied or updater-managed targets can back a venv.
+  for root in "${TRUSTED_TARGETS[@]}"; do within "$path" "$root" && return 0; done
   return 1
 }
 scan() {
@@ -209,6 +239,7 @@ scan() {
     SCAN_EXCLUDES+=("$resolved")
     expression+=(-o -path "$resolved")
   done
+  for path in "${PRUNE_PATHS[@]}"; do expression+=(-o -path "$(realpath -m -- "$path")"); done
   expression+=(')' -prune -o '(' -type l -o -name pyvenv.cfg -o -path '*/bin/python*' ')' -print0)
   for root in "${ROOTS[@]}"; do
     if [[ ! -e $root ]]; then
@@ -283,32 +314,120 @@ scan() {
     --slurpfile warnings "$WORK/warnings.ndjson" --slurpfile links "$WORK/links.ndjson" \
     '{created:$created,engine:"bash",walk_status:$walk_status,environments:$environments[0],warnings:($warnings|unique),symlinks:($links|unique)}' | atomic_write "$destination"
 }
-load_targets() {
-  local spec mm path info version prefix floor pins
-  local -A floors=()
+load_release_policy() {
+  local pins version
   pins="$(bash "${SELF%/*}/install_python.sh" --print-pins)" || die 'Cannot read release pins from the adjacent install_python.sh'
   while IFS= read -r version; do
     stable_version "$version" || die 'Installer returned an invalid release pin'
-    floors[${version%.*}]=$version
+    POLICY[${version%.*}]=$version
   done <<<"$pins"
-  : >"$WORK/targets.ndjson"
+}
+target_info() {
+  local mm=$1 path=$2 info version floor
+  info="$(probe "$path")" || return 1
+  version="$(jq -r .version <<<"$info")"
+  floor=${POLICY[$mm]}
+  [[ $(minor "$version") == "$mm" && $(jq -r .kind <<<"$info") == raw &&
+    $(jq -r .managed <<<"$info") == private ]] || return 1
+  ((10#${version##*.} >= 10#${floor##*.})) || return 1
+  printf '%s\n' "$info"
+}
+remember_target() {
+  local mm=$1 info=$2 source=$3 prefix
+  prefix="$(jq -r .prefix <<<"$info")"
+  json_edit "$WORK/targets.json" --arg mm "$mm" --arg source "$source" --argjson info "$info" '.[$mm]=$info+{minor:$mm,source:$source}'
+  PRUNE_PATHS+=("$prefix")
+  TRUSTED_TARGETS+=("$prefix")
+  event target_selected "$prefix" "$mm ($source)"
+}
+load_targets() {
+  local spec mm path info version floor
+  printf '{}\n' >"$WORK/targets.json"
   for spec in "${TARGET_SPECS[@]}"; do
     [[ $spec == *=* ]] || die 'Target syntax: MINOR=/absolute/path/bin/python'
     mm=${spec%%=*}
     path=${spec#*=}
-    [[ $mm =~ ^[0-9]+\.[0-9]+$ && ${floors[$mm]+yes} ]] || die "No tested release policy for Python $mm"
+    [[ $mm =~ ^[0-9]+\.[0-9]+$ && ${POLICY[$mm]+yes} ]] || die "No tested release policy for Python $mm"
+    jq -e --arg mm "$mm" 'has($mm)|not' "$WORK/targets.json" >/dev/null || die 'Duplicate target branch'
     info="$(probe "$path")" || die "Target is not a working CPython ELF interpreter: $path"
     version="$(jq -r .version <<<"$info")"
-    prefix="$(jq -r .prefix <<<"$info")"
-    floor=${floors[$mm]}
+    floor=${POLICY[$mm]}
     [[ $(minor "$version") == "$mm" ]] || die 'Cross-minor target refused'
     [[ $(jq -r .kind <<<"$info") == raw ]] || die 'Target must be a raw installation'
     ((10#${version##*.} >= 10#${floor##*.})) || die "Target is below policy floor $floor"
     [[ $(jq -r .managed <<<"$info") == private ]] || die 'Conda cannot serve as a raw CPython patch target'
-    jq -c --arg minor "$mm" '.+{minor:$minor}' <<<"$info" >>"$WORK/targets.ndjson"
-    EXCLUDES+=("$prefix")
+    remember_target "$mm" "$info" explicit
   done
-  jq -s 'if ([.[].minor]|length)!=([.[].minor]|unique|length) then error("Duplicate target branch") else map({key:.minor,value:.})|from_entries end' "$WORK/targets.ndjson" >"$WORK/targets.json"
+}
+healthy_target() {
+  local binary=$1 check_dir name failed=0
+  check_dir="$(mktemp -d "$WORK/target-imports.XXXXXX")"
+  (cd "$check_dir" && runpy "$binary" -I -m pydoc -w ssl sqlite3 bz2 lzma ctypes venv >imports.log 2>&1) || failed=1
+  for name in ssl sqlite3 bz2 lzma ctypes venv; do [[ -s $check_dir/$name.html ]] || failed=1; done
+  rm -rf -- "$check_dir"
+  ((failed == 0))
+}
+load_cached_targets() {
+  local mm path info
+  [[ -f $RUNTIME_DIR/targets.json ]] || return 0
+  jq -e 'type=="object" and all(.[];type=="string")' "$RUNTIME_DIR/targets.json" >/dev/null || die 'Invalid runtime cache targets.json'
+  for mm in "${!POLICY[@]}"; do
+    jq -e --arg mm "$mm" 'has($mm)' "$WORK/targets.json" >/dev/null && continue
+    path="$(jq -r --arg mm "$mm" '.[$mm]//empty' "$RUNTIME_DIR/targets.json")"
+    [[ -n $path ]] || continue
+    # Cache pointers cannot grant discovery access outside the chosen cache.
+    within "$(realpath -m -- "$path")" "$RUNTIME_DIR" || die "Cached target escapes runtime directory: $path"
+    if info="$(target_info "$mm" "$path")" && within "$(jq -r .prefix <<<"$info")" "$RUNTIME_DIR" && healthy_target "$path"; then
+      remember_target "$mm" "$info" cache
+    else
+      event target_unusable "$path" 'A fresh target will be prepared if needed'
+    fi
+  done
+}
+discover_targets() {
+  local inventory=$1 mm path info prefix
+  # Prefer the newest healthy private raw installation in the trusted scan.
+  while IFS= read -r path; do
+    info="$(jq -c --arg path "$path" '.environments[]|select(.binary==$path)' "$inventory")"
+    mm="$(minor "$(jq -r .version <<<"$info")")"
+    [[ ${POLICY[$mm]+yes} ]] || continue
+    jq -e --arg mm "$mm" 'has($mm)' "$WORK/targets.json" >/dev/null && continue
+    prefix="$(jq -r .prefix <<<"$info")"
+    protected "$prefix" && continue
+    if info="$(target_info "$mm" "$path")" && healthy_target "$path"; then remember_target "$mm" "$info" discovered; fi
+  done < <(jq -r '.environments|map(select(.kind=="raw" and .managed=="private" and (.versions|length)==1))|
+    sort_by(.version|split(".")|map(tonumber))|reverse|.[].binary' "$inventory")
+}
+prepare_targets() {
+  local plan=$1 mm build_dir path info fd
+  local -a needed=() options=(--reuse --skip-conda --no-bashrc --jobs "$BUILD_JOBS")
+  mapfile -t needed < <(jq -r '[.plan[]|select(.action=="prepare_target")|.version|split(".")[0:2]|join(".")]|unique[]' "$plan")
+  ((${#needed[@]})) || return 0
+  jq '[.plan[]|select(.action!="skip")]' "$plan" >"$WORK/control-prefixes.json"
+  assert_control_paths "$WORK/control-prefixes.json" "$OUTPUT" "$OUTPUT.entries" "$OUTPUT.post-verify.json" "$LOG_DIR" "$WORK" "$RUNTIME_DIR"
+  [[ ! -e $OUTPUT && ! -L $OUTPUT && ! -e $OUTPUT.entries && ! -L $OUTPUT.entries ]] || die 'Journal exists; choose a new output path'
+  mkdir -p -- "$RUNTIME_DIR"
+  exec {fd}>"$RUNTIME_DIR/.build.lock"
+  flock -n "$fd" || die "Another updater is preparing targets in $RUNTIME_DIR"
+  # Each build has a permanent, unique prefix. An interrupted or unhealthy
+  # cached build is never rebuilt in place underneath an existing venv.
+  build_dir="$(mktemp -d "$RUNTIME_DIR/build-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  ((SKIP_APT == 0)) || options+=(--skip-apt)
+  ((NO_SUDO == 0)) || options+=(--no-sudo)
+  event target_build_started "$build_dir" "${needed[*]}"
+  bash "${SELF%/*}/install_python.sh" "$build_dir" "${options[@]}" --py "${needed[*]}" </dev/null || die 'Target preparation failed; existing environments were not updated'
+  for mm in "${needed[@]}"; do
+    path="$build_dir/opt/python-${POLICY[$mm]}/bin/python$mm"
+    info="$(target_info "$mm" "$path")" && healthy_target "$path" || die "Prepared target failed validation: $path"
+    remember_target "$mm" "$info" installed
+  done
+  [[ -f $RUNTIME_DIR/targets.json ]] || printf '{}\n' | atomic_write "$RUNTIME_DIR/targets.json"
+  for mm in "${needed[@]}"; do
+    path="$(jq -r --arg mm "$mm" '.[$mm].binary' "$WORK/targets.json")"
+    json_edit "$RUNTIME_DIR/targets.json" --arg mm "$mm" --arg path "$path" '.[$mm]=$path'
+  done
+  event target_build_finished "$build_dir" "${needed[*]}"
+  exec {fd}>&-
 }
 protected() {
   local root
@@ -318,7 +437,7 @@ protected() {
   return 1
 }
 make_plan() {
-  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch outside
+  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch outside action older requested
   : >"$WORK/plan.ndjson"
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
@@ -327,6 +446,8 @@ make_plan() {
     mm=$(minor "$version")
     target="$(jq -c --arg mm "$mm" '.[$mm]//null' "$WORK/targets.json")"
     reason=''
+    action=update
+    requested=${POLICY[$mm]:-}
     unresolved='[]'
     flag=0
     outside=0
@@ -351,10 +472,31 @@ make_plan() {
       reason='Linked pyvenv.cfg requires a separate rebuild'
     elif ((outside)); then
       reason='Interpreter points outside discovery scope; add its target directory as a root'
-    elif [[ $target == null ]]; then
-      reason='Target interpreter missing'
     elif [[ $(jq '[.versions[]|split(".")[0:2]|join(".")]|unique|length' <<<"$item") != 1 ]]; then
       reason='Multiple minor branches share a prefix'
+    elif [[ $(stat -Lc %u -- "$prefix") != "$EUID" || ! -w $(dirname -- "$prefix") ]]; then
+      reason='Prefix ownership or parent write access does not permit updating'
+    elif [[ $target == null ]]; then
+      if [[ -z $requested ]]; then
+        reason="No tested release policy for Python $mm"
+      elif [[ $kind == raw && $(jq -r .shared <<<"$item") != 0 ]]; then
+        reason='Shared raw build requires a prefix-specific rebuild'
+      else
+        older=0 newer=0
+        patch=${requested##*.}
+        while IFS= read -r candidate; do
+          ((10#${candidate##*.} >= 10#$patch)) || older=1
+          ((10#${candidate##*.} <= 10#$patch)) || newer=1
+        done < <(jq -r '.versions[]' <<<"$item")
+        if ((older == 0 && flag == 0)); then
+          reason=up_to_date
+        elif ((newer)); then
+          reason='Downgrade refused'
+        else
+          action=prepare_target
+          reason="Prepare pinned Python $requested"
+        fi
+      fi
     elif [[ $(jq -c '[.soabi,.shared,.pointer_bits,.machine]' <<<"$item") != "$(jq -c '[.soabi,.shared,.pointer_bits,.machine]' <<<"$target")" ]]; then
       reason='Interpreter ABI/build mismatch'
     else
@@ -369,10 +511,11 @@ make_plan() {
         reason='Shared raw build requires a prefix-specific rebuild'
       elif [[ $kind == raw ]] && within "$(jq -r .prefix <<<"$target")" "$prefix"; then
         reason='Target is inside the source prefix'
-      elif [[ $(stat -Lc %u -- "$prefix") != "$EUID" || ! -w $(dirname -- "$prefix") ]]; then reason='Prefix ownership or parent write access does not permit updating'; fi
+      fi
     fi
-    jq -c --arg reason "$reason" --arg eol "${EOL[$mm]:-}" --argjson target "$target" --argjson unresolved "$unresolved" \
-      '.+{target:$target,eol:$eol,unresolved_aliases:$unresolved,action:(if $reason=="" then "update" else "skip" end),reason:$reason}' <<<"$item" >>"$WORK/plan.ndjson"
+    [[ -z $reason || $action == prepare_target ]] || action=skip
+    jq -c --arg action "$action" --arg requested "$requested" --arg reason "$reason" --arg eol "${EOL[$mm]:-}" --argjson target "$target" --argjson unresolved "$unresolved" \
+      '.+{target:$target,requested_version:$requested,eol:$eol,unresolved_aliases:$unresolved,action:$action,reason:$reason}' <<<"$item" >>"$WORK/plan.ndjson"
   done < <(jq -c '.environments[]' "$inventory")
   jq -n --slurpfile inventory "$inventory" --slurpfile plan "$WORK/plan.ndjson" \
     '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
@@ -910,8 +1053,7 @@ verify_journal() {
   ((failed == 0))
 }
 main() {
-  require_tools
-  WORK="$(mktemp -d)"
+  local root
   while [[ ${1:-} == -Y ]]; do ASSUME_YES=1; shift; done
   COMMAND=${1:---help}
   shift || true
@@ -922,16 +1064,22 @@ main() {
       ;;
     _apply-one)
       root_guard
+      require_tools
+      WORK="$(mktemp -d)"
       apply_one "$@"
       return
       ;;
     _restore)
       root_guard
+      require_tools
+      WORK="$(mktemp -d)"
       restore_one "$@"
       return
       ;;
     _verify)
       root_guard
+      require_tools
+      WORK="$(mktemp -d)"
       CHECKS=$3
       verify_journal "$1" "$2"
       return
@@ -950,7 +1098,7 @@ main() {
   root_guard
   while (($#)); do
     case "$1" in
-      --output | --checks | --exclude | --target | --log-dir)
+      --output | --checks | --exclude | --target | --log-dir | --runtime-dir | --jobs)
         (($# >= 2)) || die "Missing value for $1"
         case "$1" in
           --output) OUTPUT="$(absolute "$2")" ;;
@@ -958,11 +1106,24 @@ main() {
           --exclude) EXCLUDES+=("$(absolute "$2")") ;;
           --target) TARGET_SPECS+=("$2") ;;
           --log-dir) LOG_ROOT="$(absolute "$2")" ;;
+          --runtime-dir) RUNTIME_DIR="$(absolute "$2")" ;;
+          --jobs)
+            [[ $2 =~ ^[1-9][0-9]*$ ]] || die '--jobs requires a positive integer'
+            BUILD_JOBS=$2
+            ;;
         esac
         shift 2
         ;;
       -Y)
         ASSUME_YES=1
+        shift
+        ;;
+      --skip-apt)
+        SKIP_APT=1
+        shift
+        ;;
+      --no-sudo)
+        NO_SUDO=1 SKIP_APT=1
         shift
         ;;
       --)
@@ -979,17 +1140,34 @@ main() {
   done
   start_logging
   ((ASSUME_YES == 0)) || [[ $COMMAND == apply ]] || die '-Y is only supported by apply'
+  prepare_tools
+  WORK="$(mktemp -d)"
+  if [[ -z $OUTPUT ]]; then
+    case "$COMMAND" in
+      scan) OUTPUT="$LOG_DIR/inventory.json" ;;
+      plan) OUTPUT="$LOG_DIR/plan.json" ;;
+      apply) OUTPUT="$LOG_DIR/journal.json" ;;
+      verify) OUTPUT="$LOG_DIR/verification.json" ;;
+    esac
+  fi
+  [[ -z $OUTPUT ]] || printf 'Output: %s\n' "$OUTPUT" >&2
   if [[ -n $CHECKS ]]; then jq -e 'type=="object" and all(.[];type=="array" and all(.[];.argv|type=="array" and length>0 and all(.[];type=="string")))' "$CHECKS" >/dev/null || die 'Invalid application checks JSON'; fi
   if [[ -n $JOURNAL ]]; then
     jq -e '.schema==2 and .engine=="bash" and (.entries|type=="array")' "$JOURNAL" >/dev/null || die 'Expected a native Bash schema-2 journal'
   fi
   case "$COMMAND" in
     scan | plan | apply)
-      ((${#ROOTS[@]})) || die 'At least one trusted search root is required'
-      [[ -n $OUTPUT ]] || die '--output is required'
+      ((${#ROOTS[@]})) || ROOTS=("$(canonical "$HOME")")
+      RUNTIME_DIR="$(realpath -m -- "$RUNTIME_DIR")"
+      for root in "${ROOTS[@]}"; do
+        if within "$(realpath -m -- "$root")" "$RUNTIME_DIR"; then die 'Runtime directory must not contain a search root'; fi
+      done
+      [[ ! -f $RUNTIME_DIR/pyvenv.cfg ]] || die 'Runtime directory must be separate from existing environments'
+      PRUNE_PATHS+=("$RUNTIME_DIR" "$LOG_ROOT")
       if [[ $COMMAND != scan ]]; then
-        ((${#TARGET_SPECS[@]})) || die '--target is required'
+        load_release_policy
         load_targets
+        load_cached_targets
       fi
       event scan_started
       scan "$WORK/inventory.json"
@@ -999,9 +1177,15 @@ main() {
         event scanned '' "$(jq '.environments|length' "$OUTPUT") environments"
         return
       fi
+      discover_targets "$WORK/inventory.json"
       make_plan "$WORK/inventory.json" "$WORK/plan.json"
+      if [[ $COMMAND == apply ]]; then
+        cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
+        prepare_targets "$WORK/plan.json"
+        make_plan "$WORK/inventory.json" "$WORK/plan.json"
+      fi
       cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
-      event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$WORK/plan.json") updates"
+      event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$WORK/plan.json") updates, $(jq '[.plan[]|select(.action=="prepare_target")]|length' "$WORK/plan.json") environments need a target build"
       if [[ $COMMAND == plan ]]; then
         atomic_write "$OUTPUT" <"$WORK/plan.json"
         return
@@ -1009,7 +1193,6 @@ main() {
       apply_plan "$WORK/plan.json" "$OUTPUT"
       ;;
     verify)
-      [[ -n $OUTPUT ]] || die '--output is required'
       verify_journal "$JOURNAL" "$OUTPUT"
       ;;
     rollback)

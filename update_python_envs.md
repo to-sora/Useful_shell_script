@@ -7,6 +7,31 @@ source, Python `-c` command, companion Python file, or Python control interprete
 The installed Python binaries are invoked through `--version` and existing
 modules (`sysconfig`, `venv`, `pip`, and `pydoc`).
 
+## Quick start
+
+Stop applications using the selected environments, then run as their owner:
+
+```bash
+bash update_python_envs.sh apply "$HOME"
+```
+
+This scans the root, reads the existing version pins from `install_python.sh`,
+reuses healthy cached or discovered private Python installations, and builds
+missing targets for branches that need an update. It then asks for `y` for each
+venv, backs up approved environments, applies the update and verifies the batch.
+Failed update validation triggers rollback. `--target` and `--output` are optional.
+
+Omitting roots defaults to `$HOME`. To bypass venv confirmations:
+
+```bash
+bash update_python_envs.sh -Y apply
+```
+
+The console prints `Log:` and `Output:` paths. The default recovery journal is
+`log/<UTC timestamp>.<unique suffix>/journal.json` next to the script. The same
+directory contains `process.log`. `--print-pins` on the installer only prints
+version numbers; it does not install Python or update environments.
+
 ## Requirements and scope
 
 Use Bash 4+, GNU findutils/coreutils (including `tee`), awk, jq, rsync, and util-linux `flock`.
@@ -14,13 +39,24 @@ Use trusted roots owned by the invoking account: discovery executes candidate
 interpreters. Run without sudo. Host-root execution is rejected; a disposable
 container with the sole UID mapping `0 0 1` is the test exception.
 
+On Ubuntu, `apply` installs missing `jq`/`rsync` through apt and invokes the
+adjacent installer for missing target runtimes. Building requires network access,
+disk space and the installer's compilation dependencies. Sudo may request a
+password. `-Y` bypasses venv confirmations; sudo authentication follows the host
+configuration. `--skip-apt` uses preinstalled dependencies, and `--no-sudo` also
+implies `--skip-apt`. `--jobs N` controls compilation workers (default: 4).
+Other Linux distributions can use compatible preinstalled targets; the bundled
+source installer expects Ubuntu.
+
 The scan resolves each supplied root and walks its physical directories. It prunes
 `.git`, `node_modules`, exclusions, and updater work directories. A directory link
 under a root is recorded in the inventory. To include an external environment,
 supply its directory or the link to it as another root. This handles aliases
 and cycles without entering other trees. An interpreter link to an external
-base also requires that base as a root. A copied venv can use an explicit patch
-target when its original base is outside the scan.
+base also requires that base as a root, except for validated explicit targets
+and updater-managed cached targets. A copied venv can be updated when its
+original base is outside the scan. Cache, log and selected target directories
+are pruned from the physical walk.
 
 Discovery requires a venv configuration or a CPython standard library in the
 prefix. It checks the resolved binary's scope before invoking it through its
@@ -47,31 +83,52 @@ application-specific validation. This tool does not upgrade third-party packages
 Paths containing spaces are supported. Tabs and line breaks are rejected.
 Names containing `.pyenv-update-` are reserved and excluded from discovery.
 
-## Targets, scan, and plan
+## Default targets, scan, and plan
 
 Plan and apply read the minimum target versions from the adjacent installer.
-Run `bash install_python.sh --print-pins` to print them. Scan, verify, and
-rollback can run with the updater alone. Newer stable patch releases in the
+Run `bash install_python.sh --print-pins` to print them. These are repository
+pins, not a query for the latest upstream release. Scan, verify, and rollback
+can run with the updater alone. Newer stable patch releases in the
 listed branches may be supplied. Python
 3.8 and 3.10 have reached end of support. Their final releases do not provide
 ongoing security maintenance; migration requires a supported minor branch.
 
-Build targets in a separate directory:
+Automatic selection uses an explicit `--target` override first, a healthy
+cached target second, and a healthy private raw installation from the scan
+third. Targets must meet the pinned minimum for the same minor branch. Among
+discovered candidates, the newest patch is preferred. ABI and ownership checks
+also apply before an environment can update.
+
+If a required target is missing, `apply` calls `install_python.sh` with
+`--reuse --skip-conda --no-bashrc --py "<needed branches>"`. Only branches with
+eligible environments needing an update are built, including pinned legacy
+branches when present. An already current environment needs no build. Unknown
+branches are reported as skips. Existing package versions and minor branches
+are preserved.
+
+The managed runtime directory defaults to
+`${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater`; `--runtime-dir DIR`
+overrides it. Each build gets a permanent `build-<timestamp>.<suffix>` directory
+and the cache's `targets.json` records its interpreter paths. Failed or unhealthy
+builds are replaced by a new build directory, never repaired in place underneath
+dependent venvs. Keep these directories while venvs reference them. Target
+preparation happens before venv confirmations and receives EOF on stdin;
+declining an update can leave a prepared target for future use. A build failure
+aborts before modifying existing environments. A cache lock prevents concurrent
+builds in the same runtime directory.
+
+Scan and preview with the same defaults:
 
 ```bash
-bash install_python.sh /path/to/patched-runtimes \
-  --py "3.8 3.10 3.11 3.13" --skip-conda --jobs 4 --no-bashrc
-
-bash update_python_envs.sh scan /path/to/projects /path/to/raw-installs \
-  --output inventory.json
-
-bash update_python_envs.sh plan /path/to/projects /path/to/raw-installs \
-  --target 3.8=/path/to/patched-runtimes/opt/python-3.8.20/bin/python3.8 \
-  --target 3.10=/path/to/patched-runtimes/opt/python-3.10.22/bin/python3.10 \
-  --target 3.11=/path/to/patched-runtimes/opt/python-3.11.18/bin/python3.11 \
-  --target 3.13=/path/to/patched-runtimes/opt/python-3.13.18/bin/python3.13 \
-  --output plan.json
+bash update_python_envs.sh scan "$HOME"
+bash update_python_envs.sh plan "$HOME"
 ```
+
+`plan` performs no installations. Its JSON uses `prepare_target` for an eligible
+environment that needs a target build, `update` for a ready update, and `skip`
+with a reason for other environments. `requested_version` records the policy
+pin; a selected target can be a newer patch. Output defaults to `inventory.json`
+or `plan.json` inside the run's log directory. `--output FILE` overrides it.
 
 Review prefixes, binary aliases, discovery warnings, and skip reasons. Repeat
 `--exclude /path` to exclude trees. Standard broken aliases (`python`, `python3`, `python<minor>`)
@@ -90,9 +147,7 @@ extended attributes enabled. The filesystem and account must support those
 attributes. Venv upgrades preserve the original `pyvenv.cfg` prompt record.
 
 ```bash
-bash update_python_envs.sh apply /path/to/projects /path/to/raw-installs \
-  --target 3.11=/path/to/patched-runtimes/opt/python-3.11.18/bin/python3.11 \
-  --target 3.13=/path/to/patched-runtimes/opt/python-3.13.18/bin/python3.13 \
+bash update_python_envs.sh apply "$HOME" \
   --checks application-checks.json --output update-journal.json
 
 bash update_python_envs.sh verify update-journal.json \
@@ -116,9 +171,7 @@ discovery scope; dependent environments outside that scope are not prompted.
 Use `-Y` for unattended updates. The option is accepted before or after `apply`:
 
 ```bash
-bash update_python_envs.sh -Y apply /path/to/projects /path/to/raw-installs \
-  --target 3.11=/path/to/patched-runtimes/opt/python-3.11.18/bin/python3.11 \
-  --output update-journal.json
+bash update_python_envs.sh -Y apply "$HOME"
 ```
 
 Keep the journal, its `.entries` directory, the post-verification output and
@@ -188,7 +241,8 @@ collisions when commands start in the same second. The run directory uses mode
 The log preserves stdout and stderr while keeping both visible on their original
 terminal streams. It records the invocation, confirmations and skips, update
 stages, application-check output, validation failures, rollbacks, and final exit
-code. The command waits for the log writers before returning. Apply workers and
+code. Target selection, dependency installation and target builds share this
+log. The command waits for the log writers before returning. Apply workers and
 the final batch verification share the outer log. An explicit later verification
 or rollback starts a new log. The journal's `log_file` field locates its apply log.
 
@@ -197,7 +251,9 @@ Discovery and planning snapshots are saved alongside `process.log` as
 confirmation decisions. Use `--log-dir /path/to/logs` to choose another log root;
 the timestamp directory is created beneath it. A writable log destination is
 required before the operation starts. Logs inside a prefix selected for updating
-are rejected. Argument-parsing and missing-tool errors occur before log setup.
+are rejected. Argument-parsing errors occur before log setup; missing updater
+dependencies are reported after logging starts. Logging itself needs GNU
+coreutils and Bash.
 
 ## Validation
 
@@ -217,6 +273,21 @@ responses, EOF before publication, `-Y`, protection of declined venvs' raw bases
 hash-manifest rejection, explicit and automatic rollback, and log contents,
 location, permissions, and exit status. These tests are local regression commands;
 this change does not modify CI/CD configuration.
+
+The suite also includes `tests/python-updater-auto.bash`. It uses real old and
+patched CPython interpreters while replacing the installer's network/build step
+with a fixture that copies the patched installation into the requested layout.
+It covers planning without builds, automatic preparation and output paths,
+confirmation input isolation, cache and discovered-target reuse, explicit
+overrides, repeat runs, failed builds, and replacing unhealthy caches without
+mutating their existing dependents. This fixture tests orchestration; it does
+not exercise Ubuntu apt, source downloads or compilation.
+
+The November 11 automatic-update revision passed the complete suite with private
+CPython 3.8.19 and 3.8.20 builds, including the control/log and automatic-flow
+tests. Bash syntax checks and ShellCheck 0.10.0 at error severity passed for the
+modified scripts. Ubuntu dependency installation and source builds were not
+rerun for this revision; the earlier installer validation is recorded below.
 
 ### November 8 review and compatibility tests
 

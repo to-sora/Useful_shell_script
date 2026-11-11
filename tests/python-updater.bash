@@ -156,3 +156,4 @@ bad bash "$lab/policy/update_python_envs.sh" plan "$a" "${target_arg[@]}" --outp
 grep -F 'below policy floor' "$lab/policy-error" >/dev/null
 echo 'PASS: discovery scope, interrupted backup, dependency baseline, prompt, module errors, filesystem metadata, cleanup, stdin and shared policy'
 bash "${updater%/*}/tests/python-updater-controls.bash" "$old" "$target"
+bash "${updater%/*}/tests/python-updater-auto.bash" "$old" "$target"

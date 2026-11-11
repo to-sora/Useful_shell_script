@@ -137,6 +137,6 @@ grep -F 'Finished scan (exit 0)' "$log" >/dev/null
 [[ $(stat -c %a -- "${log%/*}") == 700 ]]
 bad bash "$lab/script-copy/update_python_envs.sh" apply "$lab/empty" --output "$lab/no-target.json" >"$lab/error-output" 2>&1
 grep -RF 'Finished apply (exit 2)' "$lab/script-copy/log" >/dev/null
-grep -RF -- '--target is required' "$lab/script-copy/log" >/dev/null
+grep -RF -- 'Cannot read release pins from the adjacent install_python.sh' "$lab/script-copy/log" >/dev/null
 
 echo 'PASS: journal placement, linked configs, per-venv confirmation, EOF, -Y, shared bases, log success/failure and rollback'
