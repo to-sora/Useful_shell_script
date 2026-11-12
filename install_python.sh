@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # NOTE: keep original structure/order as much as possible for easy git diff
 
+# One release policy for installation and same-minor patch planning.
+PY38="3.8.20"
+PY310="3.10.22"
+PY311="3.11.18"
+PY313="3.13.18"
+PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")
+if [[ $# == 1 && $1 == --print-pins ]]; then
+  printf '%s\n' "${PY_VERSIONS[@]}"
+  exit 0
+fi
+
 # ---- run-as-user safety (original intent, strengthened) ----
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   echo "FATAL: do not run as root; run as a normal user." >&2; exit 1
@@ -15,29 +26,24 @@ umask 022
 # ---- better failure signal (does not change control flow, only diagnostics) ----
 trap 'echo "FATAL: failed at line ${BASH_LINENO[0]}: ${BASH_COMMAND}" >&2' ERR
 
-# ===== pinned versions (your previous working set) =====
-# Add Python 3.13 (latest 3.13.x maintenance release currently: 3.13.11) :contentReference[oaicite:2]{index=2}
-PY38="3.8.19"
-PY310="3.10.18"
-PY311="3.11.13"
-PY313="3.13.11"
-PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")   # build newest first
-
-MINIFORGE_VER="25.9.1-0"
+MINIFORGE_VER="26.9.4-1"
 MINIFORGE_FN="Miniforge3-${MINIFORGE_VER}-Linux-x86_64.sh"
 
 # Python OpenPGP keys (branch release managers); fetched from keyserver (not a dead URL)
-# Add 3.13.x key id per python.org OpenPGP verification metadata :contentReference[oaicite:3]{index=3}
+# Release-manager keys from python.org verification metadata.
 PY_PGP_KEYS=("A821E680E5FA6305" "B26995E310250568" "64E628F8D684696D")
 KEYSERVERS=("hkps://keyserver.ubuntu.com" "hkps://keys.openpgp.org" "hkp://pgp.mit.edu")
 REUSE=0; SKIP_APT=0; SKIP_GPG=0; NO_BASHRC=0
 NO_SUDO=0       # <--- ADDED
-WANT_PYS=""     # <--- ADDED
+WANT_PYS="3.13 3.11"
+SKIP_CONDA=0
+BUILD_JOBS="$(nproc)"
 
 usage() {
   cat >&2 <<EOF
 Usage:
-  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.10"]
+  bash $0 --print-pins
+  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--skip-conda] [--jobs N]
 
 Notes:
 - BASE_DIR is any directory (can be on /). Script will create subdirs under it.
@@ -45,6 +51,9 @@ Notes:
 - --skip-apt skips apt dependency install.
 - --skip-gpg skips OpenPGP verification.
 - --no-bashrc will not append PATH block to ~/.bashrc.
+- --skip-conda builds CPython without installing or updating Miniforge.
+- --jobs N selects the number of compilation workers.
+- Default branches: 3.13 and 3.11. Explicit 3.8/3.10 selections are end-of-life.
 EOF
   exit 2
 }
@@ -62,10 +71,21 @@ while [[ "${#}" -gt 0 ]]; do
     --skip-gpg) SKIP_GPG=1 ;;
     --no-bashrc) NO_BASHRC=1 ;;
     --no-sudo) NO_SUDO=1 ;;          # <--- ADDED
-    --py) shift; WANT_PYS="$1" ;;    # <--- ADDED (e.g. "3.13 3.10")
+    --py) [[ $# -ge 2 && -n "$2" ]] || usage; shift; WANT_PYS="$1" ;;
+    --skip-conda) SKIP_CONDA=1 ;;
+    --jobs) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || usage; shift; BUILD_JOBS="$1" ;;
     *) usage ;;
   esac
   shift || true
+done
+read -r -a selected_branches <<<"$WANT_PYS"
+[[ ${#selected_branches[@]} -gt 0 ]] || usage
+for selected in "${selected_branches[@]}"; do
+  case "$selected" in
+    3.11|3.13) ;;
+    3.8|3.10) log "WARNING: Python $selected is end-of-life; migration to a supported branch is required." ;;
+    *) die "Unsupported Python branch: $selected" ;;
+  esac
 done
 as_root() {
   if [[ "${NO_SUDO}" -eq 1 ]]; then
@@ -258,7 +278,8 @@ download_python() {
   local sig="${BASE_DIR}/src/${asc}"
 
   if [[ -f "${tar}" && -f "${sig}" ]]; then
-    log "Python ${ver} tarball already present; skipping download"
+    log "Python ${ver} tarball present; verifying cached archive"
+    verify_python "${tar}" "${sig}"
     return 0
   fi
 
@@ -267,6 +288,25 @@ download_python() {
   download_file "${base}/${asc}" "${sig}"
   (cd "${BASE_DIR}/src" && sha256sum "${fn}" | tee "${fn}.sha256.local" >/dev/null)
   verify_python "${tar}" "${sig}"
+}
+
+check_python_modules() {
+  local pybin="$1" check_dir module failed=0
+  check_dir="$(mktemp -d "${BASE_DIR}/CACHE/tmp/python-imports.XXXXXX")"
+  (
+    cd "${check_dir}" || exit 1
+    "${pybin}" -I -m pydoc -w ssl sqlite3 lzma bz2 readline uuid ctypes tkinter >imports.log 2>&1
+  ) || failed=1
+  for module in ssl sqlite3 lzma bz2 readline uuid ctypes tkinter; do
+    if [[ ! -s "${check_dir}/${module}.html" ]]; then
+      printf 'Module check failed: %s (%s)\n' "${module}" "${pybin}" >&2
+      failed=1
+    fi
+  done
+  if ((failed)) && [[ -f ${check_dir}/imports.log ]]; then cat "${check_dir}/imports.log" >&2; fi
+  rm -rf -- "${check_dir}"
+  "${pybin}" -I -m pip --version || failed=1
+  ((failed == 0))
 }
 
 build_install_python() {
@@ -278,9 +318,15 @@ build_install_python() {
   local tar="${BASE_DIR}/src/Python-${ver}.tar.xz"
 
   if [[ -x "${pybin}" ]]; then
-    log "Python ${ver} already installed at ${pybin}; skipping build"
-    "${pybin}" -V
-    return 0
+    local installed
+    installed="$("${pybin}" -I --version)"
+    installed="${installed#Python }"
+    [[ "${installed}" == "${ver}" ]] || die "Prefix ${prefix} contains Python ${installed}; expected ${ver}"
+    if check_python_modules "${pybin}"; then
+      log "Python ${ver} installed and validated at ${pybin}; skipping build"
+      return 0
+    fi
+    log "Incomplete Python ${ver} installation; rebuilding ${prefix}"
   fi
 
   log "Extracting Python ${ver}"
@@ -290,14 +336,12 @@ build_install_python() {
   cd "${src_dir}"
   [[ -f Makefile ]] && make distclean >/dev/null 2>&1 || true
   ./configure --prefix="${prefix}" --with-ensurepip=upgrade
-  make -j "$(nproc)"
+  make -j "${BUILD_JOBS}"
   as_root make altinstall
 
   log "Sanity check Python ${ver}"
   "${pybin}" -V
-  "${pybin}" -c "import ssl,sqlite3,lzma,bz2,readline,uuid,ctypes; print('ssl=',ssl.OPENSSL_VERSION)"
-  "${pybin}" -c "import tkinter; print('tkinter=ok')" >/dev/null 2>&1 || die "tkinter missing (check tk-dev)"
-  "${pybin}" -m pip --version
+  check_python_modules "${pybin}" || die "Python ${ver} failed its module checks"
 }
 
 write_env_common() {
@@ -519,10 +563,14 @@ tests() {
 
   # Helper to run test only if the binary exists
   run_test_if_exists() {
-    local bin="$1"
+    local bin="$1" expected="$2"
     if [[ -x "${bin}" ]]; then
       log "Testing ${bin}..."
-      "${bin}" bash -lc 'python -V; pip --version; python -c "import sys; print(sys.executable)"'
+      local actual
+      actual="$("${bin}" python -I --version)"
+      [[ "${actual}" == "Python ${expected}" ]] || die "Wrapper ${bin} selected ${actual}; expected ${expected}"
+      log "${actual} through ${bin}"
+      "${bin}" python -m pip --version
     else
       # Optional: log that we are skipping it
       # log "Skipping ${bin} (not installed)"
@@ -530,13 +578,13 @@ tests() {
     fi
   }
 
-  run_test_if_exists "${BASE_DIR}/bin/py38"
-  run_test_if_exists "${BASE_DIR}/bin/py10"
-  run_test_if_exists "${BASE_DIR}/bin/py11"
-  run_test_if_exists "${BASE_DIR}/bin/py13"
+  if should_proc "3.8"; then run_test_if_exists "${BASE_DIR}/bin/py38" "${PY38}"; fi
+  if should_proc "3.10"; then run_test_if_exists "${BASE_DIR}/bin/py10" "${PY310}"; fi
+  if should_proc "3.11"; then run_test_if_exists "${BASE_DIR}/bin/py11" "${PY311}"; fi
+  if should_proc "3.13"; then run_test_if_exists "${BASE_DIR}/bin/py13" "${PY313}"; fi
 
+  [[ "${SKIP_CONDA}" -eq 1 ]] && return 0
   log "Testing conda wrappers"
-  # Conda is always installed by this script, so we test it unconditionally
   bash -lc "
     set -euo pipefail
     source \"${BASE_DIR}/CACHE/env_common.sh\"
@@ -627,7 +675,7 @@ main() {
   if should_proc "3.8";  then build_install_python "${PY38}"  "3.8";  fi
 
   create_python_entrypoints
-  install_miniforge
+  if [[ "${SKIP_CONDA}" -eq 0 ]]; then install_miniforge; fi
   tests
 
   if [[ "${NO_BASHRC}" -eq 0 ]]; then
