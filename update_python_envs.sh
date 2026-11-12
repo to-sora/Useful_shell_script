@@ -12,6 +12,9 @@ declare -a PRUNE_PATHS=() TRUSTED_TARGETS=()
 declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
 ASSUME_YES=0
+INTERACTIVE=0 BATCH_APPROVED=0 STORAGE_READY=0
+declare -a MOUNT_PATHS=() MOUNT_CLASSES=()
+declare -A STORAGE_WARNED=()
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater"
 BUILD_JOBS=4
 SKIP_APT=0 NO_SUDO=0
@@ -64,13 +67,19 @@ start_logging() {
 usage() {
   cat <<'HELP'
 Usage:
+  update_python_envs.sh                 # discover SSD installations, Enter to apply
   update_python_envs.sh scan [ROOT...]
   update_python_envs.sh plan [ROOT...]
   update_python_envs.sh [-Y] apply [ROOT...]
   update_python_envs.sh verify JOURNAL
   update_python_envs.sh rollback JOURNAL
 
-Roots default to HOME. Plan/apply use the adjacent installer's release pins.
+With no arguments, discover private installations on mounted SSD/memory filesystems,
+show the plan and ask for Enter before preparing targets or changing environments.
+Original Python and venv base paths are required in this mode. No installer changes
+or installation registry are needed. Explicit commands retain their HOME default.
+HDD-backed and unknown storage (including link targets) is excluded from discovery.
+Plan/apply use the adjacent installer's release pins.
 Apply reuses healthy targets or builds missing branches, then updates environments.
 Plan reports required builds without installing. Installer --print-pins lists versions.
 Options: --target MINOR=/existing/bin/python (repeatable override),
@@ -80,7 +89,8 @@ Options: --target MINOR=/existing/bin/python (repeatable override),
          --runtime-dir DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater),
          --jobs N (default: 4), --skip-apt, --no-sudo (implies --skip-apt).
 Automatic builds use install_python.sh with --skip-conda and --no-bashrc.
-Ubuntu dependency installation and builds may request a sudo password.
+Explicit commands may request a sudo password for Ubuntu dependencies/builds.
+No-argument mode requires preinstalled dependencies and uses --skip-apt --no-sudo.
 Apply asks for y/Y for each venv before changing any environment; other answers
 skip it. EOF aborts before updating. -Y before or after apply bypasses prompts.
 Each public command writes DIR/<UTC timestamp>.<unique suffix>/process.log.
@@ -95,7 +105,7 @@ HELP
 require_tools() {
   local tool
   [[ ${BASH_VERSINFO[0]} -ge 4 ]] || die 'Bash 4 or newer is required'
-  for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od tee; do
+  for tool in jq find realpath stat readlink sha256sum rsync cp mv mktemp flock timeout awk sort sync od tee findmnt lsblk; do
     command -v "$tool" >/dev/null || die "Required utility missing: $tool"
   done
 }
@@ -104,6 +114,7 @@ prepare_tools() {
   local -a missing=()
   for tool in jq rsync; do command -v "$tool" >/dev/null || missing+=("$tool"); done
   if ((${#missing[@]})) && [[ $COMMAND == apply ]] && ((SKIP_APT == 0)); then
+    ((INTERACTIVE == 0)) || die "Install required utilities before interactive updates: ${missing[*]}"
     os="$(. /etc/os-release && printf '%s' "$ID")"
     [[ $os == ubuntu ]] || die "Install required utilities: ${missing[*]}"
     command -v sudo >/dev/null || die "Install required utilities: ${missing[*]} (sudo unavailable)"
@@ -130,6 +141,80 @@ canonical() {
   realpath -e -- "$1"
 }
 within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
+
+# Read the mount table once. Walking each mount with -xdev and pruning every
+# nested mount prevents even a directory traversal into an HDD/bind mount.
+# Inverse lsblk trees include the backing devices of partitions, LVM and RAID.
+# A single rotational member excludes the complete stack. Unknown/loop/network
+# storage is excluded rather than assuming that a missing ROTA value means SSD.
+load_storage() {
+  local path class
+  findmnt --json --list --output TARGET,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
+  if ! lsblk --json --inverse --output MAJ:MIN,ROTA,TYPE >"$WORK/block-devices.json" 2>"$WORK/lsblk-errors"; then
+    printf '{"blockdevices":[]}\n' >"$WORK/block-devices.json"
+  fi
+  jq -e '(.filesystems|type)=="array" and all(.filesystems[];
+    (.target|type)=="string" and (.target|startswith("/")) and (.target|test("[\\t\\r\\n]")|not))' \
+    "$WORK/mounts.json" >/dev/null || die 'Unsupported paths in mount inventory'
+  jq -n --slurpfile mounts "$WORK/mounts.json" --slurpfile devices "$WORK/block-devices.json" '
+    def backing: recurse(.children[]?);
+    def disk_class:
+      if any(backing; .rota==true or .rota==1 or .rota=="1") then "hdd"
+      elif any(backing; .type=="loop" or (.rota!=false and .rota!=0 and .rota!="0")) then "unknown"
+      else "ssd" end;
+    [$devices[0].blockdevices[]? | backing | {device:.["maj:min"],class:disk_class}]
+    | group_by(.device) | map({key:.[0].device,value:
+        (if any(.[];.class=="hdd") then "hdd"
+         elif any(.[];.class=="unknown") then "unknown" else "ssd" end)}) | from_entries as $disks
+    | [$mounts[0].filesystems[] | {path:.target, filesystem:.fstype,
+        class:(if (.fstype=="tmpfs" or .fstype=="ramfs") then "memory"
+          elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$"))
+          then ($disks[.["maj:min"]] // "unknown") else "unknown" end)}]
+    | sort_by(.path|length) | reverse' >"$WORK/storage.json" || die 'Invalid storage inventory'
+  MOUNT_PATHS=() MOUNT_CLASSES=()
+  while IFS= read -r -d '' path && IFS= read -r -d '' class; do
+    MOUNT_PATHS+=("$path")
+    MOUNT_CLASSES+=("$class")
+  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000"' "$WORK/storage.json")
+  STORAGE_READY=1
+  cp -- "$WORK/storage.json" "$LOG_DIR/storage.json"
+}
+storage_class() {
+  local path=$1 i
+  STORAGE_CLASS=unknown
+  for i in "${!MOUNT_PATHS[@]}"; do
+    if within "$path" "${MOUNT_PATHS[$i]}"; then
+      STORAGE_CLASS=${MOUNT_CLASSES[$i]}
+      break
+    fi
+  done
+}
+storage_allowed() {
+  local path=$1
+  ((STORAGE_READY)) || return 0
+  storage_class "$path"
+  [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory ]]
+}
+storage_warning() {
+  local path=$1
+  [[ ! ${STORAGE_WARNED[$path]+yes} ]] || return 0
+  STORAGE_WARNED[$path]=1
+  storage_class "$path"
+  warning "$path" "Storage excluded: $STORAGE_CLASS"
+  event storage_skipped "$path" "$STORAGE_CLASS"
+}
+automatic_roots() {
+  local path i
+  ROOTS=()
+  for i in "${!MOUNT_PATHS[@]}"; do
+    path=${MOUNT_PATHS[$i]}
+    case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) continue ;; esac
+    protected "$path" && continue
+    if within "$path" "$RUNTIME_DIR" || within "$path" "$LOG_ROOT"; then continue; fi
+    case "${MOUNT_CLASSES[$i]}" in ssd | memory) ROOTS+=("$path") ;; esac
+  done
+  ((${#ROOTS[@]})) || die 'No SSD or memory filesystems available for discovery; see storage.json'
+}
 assert_control_paths() {
   local prefixes=$1 path resolved prefix
   shift
@@ -164,6 +249,7 @@ config_value() {
 probe() {
   local binary version report prefix base abi shared bits pure plat machine configured managed='private'
   binary="$(absolute "$1")"
+  storage_allowed "$(realpath -m -- "$binary")" || return 1
   is_elf "$binary" || return 1
   version="$(PY_TIMEOUT=45 runpy "$binary" -I --version 2>/dev/null)" || return 1
   version=${version#Python }
@@ -217,6 +303,7 @@ event() { jq -cn --arg time "$(now)" --arg event "$1" --arg prefix "${2:-}" --ar
 warning() { jq -cn --arg path "$1" --arg reason "$2" '{path:$path,reason:$reason}' >>"$WORK/warnings.ndjson"; }
 scan_path_allowed() {
   local path=$1 root
+  storage_allowed "$path" || return 1
   case "/${path#/}/" in */.git/* | */node_modules/* | *"$MARKER"*) return 1 ;; esac
   for root in "${SCAN_EXCLUDES[@]}"; do within "$path" "$root" && return 1; done
   for root in "${SCAN_ROOTS[@]}"; do within "$path" "$root" && return 0; done
@@ -224,40 +311,93 @@ scan_path_allowed() {
   for root in "${TRUSTED_TARGETS[@]}"; do within "$path" "$root" && return 0; done
   return 1
 }
+find_literal() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\*/\\*}
+  value=${value//\?/\\?}
+  value=${value//\[/\\[}
+  value=${value//\]/\\]}
+  printf '%s\n' "$value"
+}
+walk_root_allowed() {
+  local path=$1 excluded
+  if ((INTERACTIVE)); then
+    case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) return 1 ;; esac
+    protected "$path" && return 1
+  fi
+  for excluded in "${SCAN_EXCLUDES[@]}" "${PRUNE_PATHS[@]}"; do
+    within "$path" "$(realpath -m -- "$excluded")" && return 1
+  done
+  return 0
+}
 scan() {
-  local destination=$1 root path name resolved prefix base info marker line status=0
+  local destination=$1 root path name resolved prefix base info marker line status=0 mount identity owner flag
   local -a expression=('(' -name "*$MARKER*" -o -name .git -o -path '*/.git/*' -o -name node_modules -o -path '*/node_modules/*')
-  local -A seen=()
+  local -a walk_expression=()
+  local -A seen=() identities=() walk_seen=()
   SCAN_ROOTS=()
   SCAN_EXCLUDES=()
   : >"$WORK/probes.ndjson"
   : >"$WORK/warnings.ndjson"
   : >"$WORK/links.ndjson"
   : >"$WORK/found"
+  STORAGE_WARNED=()
+  if ((INTERACTIVE)); then
+    for path in /proc /sys /dev /run /usr /bin /sbin /lib /lib64 /System "${CODEX_PRIMARY_RUNTIME_ROOT:-}"; do
+      [[ -z $path ]] || expression+=(-o -path "$(find_literal "$(realpath -m -- "$path")")")
+    done
+  fi
   for path in "${EXCLUDES[@]}"; do
     resolved="$(realpath -m -- "$path")"
     SCAN_EXCLUDES+=("$resolved")
-    expression+=(-o -path "$resolved")
+    expression+=(-o -path "$(find_literal "$resolved")")
   done
-  for path in "${PRUNE_PATHS[@]}"; do expression+=(-o -path "$(realpath -m -- "$path")"); done
+  for path in "${PRUNE_PATHS[@]}"; do expression+=(-o -path "$(find_literal "$(realpath -m -- "$path")")"); done
   expression+=(')' -prune -o '(' -type l -o -name pyvenv.cfg -o -path '*/bin/python*' ')' -print0)
   for root in "${ROOTS[@]}"; do
+    resolved="$(realpath -m -- "$root")"
+    if ! storage_allowed "$resolved"; then
+      storage_warning "$resolved"
+      continue
+    fi
     if [[ ! -e $root ]]; then
       warning "$root" 'Missing search root'
       continue
     fi
     resolved="$(canonical "$root")"
+    walk_root_allowed "$resolved" || continue
     SCAN_ROOTS+=("$resolved")
     if [[ -L $root ]]; then
       jq -cn --arg path "$root" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
     fi
   done
-  # A physical walk reaches in-root directories without descending via aliases.
-  # Only a link supplied as a root grants access to an external directory.
-  if ((${#SCAN_ROOTS[@]})); then
-    find -P "${SCAN_ROOTS[@]}" "${expression[@]}" >"$WORK/found" 2>"$WORK/find-errors" || status=$?
-    while IFS= read -r line; do warning '' "$line"; done <"$WORK/find-errors"
-  fi
+  # A selected SSD root can contain other SSD mountpoints. Add those roots
+  # explicitly; each individual walk still stops at every mount boundary.
+  for root in "${SCAN_ROOTS[@]}"; do
+    for mount in "$root" "${MOUNT_PATHS[@]}"; do
+      within "$mount" "$root" && storage_allowed "$mount" || continue
+      walk_root_allowed "$mount" || continue
+      [[ ! ${walk_seen[$mount]+yes} ]] || continue
+      walk_seen[$mount]=1
+    done
+  done
+  SCAN_ROOTS=()
+  for root in "${!walk_seen[@]}"; do SCAN_ROOTS+=("$root"); done
+  # Explicit roots retain their discovery boundary. Automatic mode enumerates
+  # allowed mounts; neither mode follows directory links during the walk.
+  : >"$WORK/find-errors"
+  for root in "${SCAN_ROOTS[@]}"; do
+    walk_expression=('(')
+    for mount in "${MOUNT_PATHS[@]}"; do
+      [[ $mount != "$root" ]] && within "$mount" "$root" || continue
+      walk_expression+=(-path "$(find_literal "$mount")" -o)
+      storage_allowed "$mount" || storage_warning "$mount"
+    done
+    walk_expression+=(-false ')' -prune -o)
+    find -P "$root" -xdev "${walk_expression[@]}" "${expression[@]}" >>"$WORK/found" 2>>"$WORK/find-errors" || status=$?
+  done
+  while IFS= read -r line; do warning '' "$line"; done <"$WORK/find-errors"
   while IFS= read -r -d '' path; do
     safe_path "$path"
     scan_path_allowed "$path" || continue
@@ -266,6 +406,10 @@ scan() {
     if [[ -L $path ]]; then
       resolved="$(realpath -m -- "$path")"
       jq -cn --arg path "$path" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
+      if ! storage_allowed "$resolved"; then
+        storage_warning "$resolved"
+        continue
+      fi
       if ! scan_path_allowed "$resolved"; then
         warning "$path" 'Link target outside discovery scope'
         continue
@@ -282,6 +426,30 @@ scan() {
     is_python_name "$name" && [[ $path == */bin/"$name" ]] || continue
     prefix=${path%/bin/*}
     scan_path_allowed "$prefix" || continue
+    if ((INTERACTIVE)); then
+      protected "$prefix" && continue
+    fi
+    # Check config/base and library locations before invoking a copied venv or
+    # a linked interpreter. Its startup may otherwise read an HDD-backed base.
+    base=''
+    if [[ -f $prefix/pyvenv.cfg ]]; then
+      resolved="$(realpath -m -- "$prefix/pyvenv.cfg")"
+      if ! storage_allowed "$resolved"; then
+        storage_warning "$resolved"
+        continue
+      fi
+      base="$(awk '/^home[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$prefix/pyvenv.cfg")"
+    fi
+    flag=0
+    for root in "$prefix/lib" "$prefix/lib64" "$base"; do
+      [[ -n $root ]] || continue
+      resolved="$(realpath -m -- "$root")"
+      if ! storage_allowed "$resolved"; then
+        storage_warning "$resolved"
+        flag=1
+      fi
+    done
+    ((flag == 0)) || continue
     # An arbitrary executable named python in a project bin directory is not
     # enough. Require a venv config or a CPython standard library in the prefix.
     marker=''
@@ -292,6 +460,13 @@ scan() {
       fi
     done
     [[ -n $marker ]] || continue
+    if ((INTERACTIVE)); then
+      owner="$(stat -Lc %u -- "$prefix")"
+      if [[ $owner != "$EUID" ]]; then
+        warning "$prefix" 'Prefix owned by another account; original-path updates require owner access'
+        continue
+      fi
+    fi
     if ! info="$(probe "$path")"; then
       warning "$path" 'Missing, non-ELF, or unusable CPython interpreter'
       continue
@@ -300,6 +475,12 @@ scan() {
       warning "$path" 'Interpreter reports a different prefix'
       continue
     fi
+    identity="$(stat -Lc '%d:%i' -- "$prefix")"
+    if [[ ${identities[$identity]:-$prefix} != "$prefix" ]]; then
+      warning "$prefix" "Directory alias of ${identities[$identity]}"
+      continue
+    fi
+    identities[$identity]=$prefix
     base="$(jq -r .base_prefix <<<"$info")"
     if scan_path_allowed "$(realpath -m -- "$base/bin/python$(minor "$(jq -r .version <<<"$info")")")"; then
       jq -c '.+{base_in_scope:true}' <<<"$info" >>"$WORK/probes.ndjson"
@@ -328,7 +509,7 @@ target_info() {
   version="$(jq -r .version <<<"$info")"
   floor=${POLICY[$mm]}
   [[ $(minor "$version") == "$mm" && $(jq -r .kind <<<"$info") == raw &&
-    $(jq -r .managed <<<"$info") == private ]] || return 1
+  $(jq -r .managed <<<"$info") == private ]] || return 1
   ((10#${version##*.} >= 10#${floor##*.})) || return 1
   printf '%s\n' "$info"
 }
@@ -521,6 +702,62 @@ make_plan() {
     '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
 }
 
+# Interactive updates keep the original raw base. The advanced, explicitly
+# scoped commands retain their separate-target behavior for rebuild workflows.
+require_original_bases() {
+  local plan=$1 errors
+  errors="$(jq -r '
+    .plan as $all | .plan[] | select(.action=="update" or .action=="prepare_target") |
+    if .kind=="venv" then . as $venv |
+      [$all[]|select(.kind=="raw" and .prefix==$venv.base_prefix and
+        (.action=="update" or .action=="prepare_target" or .reason=="up_to_date") and
+        (.target.version//.requested_version)==($venv.target.version//$venv.requested_version))] |
+      if length==1 then empty else "Original base unavailable for " + $venv.prefix + ": " + $venv.base_prefix end
+    else . as $raw | $all[] | select(.kind=="venv" and .base_prefix==$raw.prefix and .action=="skip") |
+      "Dependent venv blocks original base " + $raw.prefix + ": " + .prefix + " (" + .reason + ")" end' "$plan")"
+  [[ -z $errors ]] || die "$errors"
+  json_edit "$plan" '.plan |= map(if .kind=="venv" and (.action=="update" or .action=="prepare_target")
+    then .required_base=.base_prefix else . end)'
+}
+confirm_interactive() {
+  local plan=$1 answer count
+  printf '\nDiscovered environments (original paths are retained):\n' >&2
+  jq -r '.plan[]|[.kind,.prefix,(.version+" -> "+(.target.version//.requested_version)),.action,.reason]|@tsv' "$plan" >&2
+  printf '\nStorage inventory: %s/storage.json\n' "$LOG_DIR" >&2
+  count="$(jq '[.plan[]|select(.action=="update" or .action=="prepare_target")]|length' "$plan")"
+  if ((count == 0)); then
+    event no_updates '' 'Review plan.json and inventory.json for exclusions and skip reasons'
+    return 1
+  fi
+  require_original_bases "$plan"
+  jq '[.plan[]|select(.action=="update" or .action=="prepare_target")|
+    {prefix,version,target_version:(.target.version//.requested_version),required_base}]' "$plan" >"$WORK/approved-intent.json"
+  printf '\nStop applications using these environments. Update %s environments at their original paths? [Enter=yes, n=cancel] ' "$count" >&2
+  if ! IFS= read -r answer; then
+    printf '\n' >&2
+    die 'Confirmation input ended; no targets prepared or environments updated'
+  fi
+  case "$answer" in
+    '' | y | Y)
+      BATCH_APPROVED=1
+      event confirmation '' 'Approved original-path batch'
+      ;;
+    *)
+      event cancelled '' 'No targets prepared or environments updated'
+      return 1
+      ;;
+  esac
+}
+check_interactive_plan() {
+  local plan=$1
+  require_original_bases "$plan"
+  jq -e --slurpfile intent "$WORK/approved-intent.json" '
+    .plan as $plan | all($intent[0][]; . as $expected |
+      any($plan[]; .prefix==$expected.prefix and .version==$expected.version and
+        .action=="update" and .target.version==$expected.target_version and
+        .required_base==$expected.required_base))' "$plan" >/dev/null || die 'Prepared targets changed the approved plan; no environments updated'
+}
+
 confirm_plan() {
   local plan=$1 destination=$2 item prefix answer input_fd base
   local -A blocked=()
@@ -531,7 +768,9 @@ confirm_plan() {
     if [[ $(jq -r .kind <<<"$item") == venv ]]; then
       prefix="$(jq -r .prefix <<<"$item")"
       if [[ $(jq -r .action <<<"$item") == update ]]; then
-        if ((ASSUME_YES)); then
+        if ((BATCH_APPROVED)); then
+          item="$(jq -c '.approval="confirmed"' <<<"$item")"
+        elif ((ASSUME_YES)); then
           item="$(jq -c '.approval="bypassed"' <<<"$item")"
           event confirmation "$prefix" 'bypassed (-Y)'
         else
@@ -734,6 +973,7 @@ application_checks() {
 }
 validate() {
   local prefix=$1 expected=$2 package_file=$3 manifest=$4 logical=$5 phase=$6 checks=$7 destination=$8
+  local required_base=${9:-}
   local path name info binary mm actual core issues='[]' added count=0 unresolved='[]' pip_status='pip absent'
   mm=$(minor "$expected")
   : >"$WORK/validated.ndjson"
@@ -753,6 +993,10 @@ validate() {
       printf 'Wrong version/prefix: %s\n' "$path" >&2
       return 1
     }
+    if [[ -n $required_base && $(jq -r .base_prefix <<<"$info") != "$required_base" ]]; then
+      printf 'Original base changed: %s (expected %s)\n' "$path" "$required_base" >&2
+      return 1
+    fi
     printf '%s\n' "$info" >>"$WORK/validated.ndjson"
     count=$((count + 1))
   done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
@@ -912,7 +1156,7 @@ apply_one() {
   jq .package_snapshot "$entry" >"$packages_file"
   result="$WORK/staged-validation.json"
   event validate_stage "$prefix"
-  validate "$stage" "$version" "$packages_file" '' "$prefix" stage "$checks" "$result"
+  validate "$stage" "$version" "$packages_file" '' "$prefix" stage "$checks" "$result" "$(jq -r '.required_base//empty' "$entry")"
   manifest="$WORK/runtime-hashes.json"
   hashes "$stage" "$kind" "$manifest"
   checkpoint "$entry" "$journal" --slurpfile hashes "$manifest" --slurpfile result "$result" '.runtime_hashes=$hashes[0]|.staged_validation=$result[0]|.status="prepared"'
@@ -926,7 +1170,7 @@ apply_one() {
   checkpoint "$entry" "$journal" '.status="installed"'
   result="$WORK/final-validation.json"
   event validate_final "$prefix"
-  validate "$prefix" "$version" "$packages_file" "$manifest" "$prefix" final "$checks" "$result"
+  validate "$prefix" "$version" "$packages_file" "$manifest" "$prefix" final "$checks" "$result" "$(jq -r '.required_base//empty' "$entry")"
   checkpoint "$entry" "$journal" --slurpfile result "$result" --arg at "$(now)" '.validation=$result[0]|.status="verified"|.finished=$at'
   trap - ERR INT TERM
   rm -rf -- "$stage" || printf 'Stage cleanup failed: %s\n' "$stage" >&2
@@ -987,6 +1231,10 @@ apply_plan() {
       jq -c '.action="skip"|.reason="Package snapshot failed"' <<<"$item" >>"$WORK/prepared-plan.ndjson"
     fi
   done < <(jq -c '.plan[]' "$plan")
+  if ((INTERACTIVE && failed)); then
+    json_edit "$journal" --argjson failures "$failed" '.complete=true|.failures=$failures'
+    die 'Package snapshots failed; no environments updated'
+  fi
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
     if [[ $(jq -r .kind <<<"$item") == raw && ${blocked[$prefix]+yes} ]]; then
@@ -1040,7 +1288,7 @@ verify_journal() {
     result="$(mktemp "$WORK/result.XXXXXX")"
     jq .package_snapshot <<<"$entry" >"$packages_file"
     jq .runtime_hashes <<<"$entry" >"$manifest"
-    if validate "$prefix" "$(jq -r .target.version <<<"$entry")" "$packages_file" "$manifest" "$prefix" final "$CHECKS" "$result" 2>"$WORK/verify-error"; then
+    if validate "$prefix" "$(jq -r .target.version <<<"$entry")" "$packages_file" "$manifest" "$prefix" final "$CHECKS" "$result" "$(jq -r '.required_base//empty' <<<"$entry")" 2>"$WORK/verify-error"; then
       jq -cn --arg prefix "$prefix" --slurpfile validation "$result" '{prefix:$prefix,passed:true,validation:$validation[0]}' >>"$WORK/verification.ndjson"
     else
       failed=$((failed + 1))
@@ -1054,8 +1302,17 @@ verify_journal() {
 }
 main() {
   local root
-  while [[ ${1:-} == -Y ]]; do ASSUME_YES=1; shift; done
+  if (($# == 0)); then
+    INTERACTIVE=1
+    SKIP_APT=1
+    NO_SUDO=1
+  fi
+  while [[ ${1:-} == -Y ]]; do
+    ASSUME_YES=1
+    shift
+  done
   COMMAND=${1:---help}
+  ((INTERACTIVE == 0)) || COMMAND=apply
   shift || true
   case "$COMMAND" in
     -h | --help | help)
@@ -1157,8 +1414,13 @@ main() {
   fi
   case "$COMMAND" in
     scan | plan | apply)
-      ((${#ROOTS[@]})) || ROOTS=("$(canonical "$HOME")")
       RUNTIME_DIR="$(realpath -m -- "$RUNTIME_DIR")"
+      load_storage
+      if ((INTERACTIVE)); then
+        automatic_roots
+      else
+        ((${#ROOTS[@]})) || ROOTS=("$(canonical "$HOME")")
+      fi
       for root in "${ROOTS[@]}"; do
         if within "$(realpath -m -- "$root")" "$RUNTIME_DIR"; then die 'Runtime directory must not contain a search root'; fi
       done
@@ -1179,10 +1441,15 @@ main() {
       fi
       discover_targets "$WORK/inventory.json"
       make_plan "$WORK/inventory.json" "$WORK/plan.json"
+      if ((INTERACTIVE)); then
+        cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
+        if ! confirm_interactive "$WORK/plan.json"; then return; fi
+      fi
       if [[ $COMMAND == apply ]]; then
         cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
         prepare_targets "$WORK/plan.json"
         make_plan "$WORK/inventory.json" "$WORK/plan.json"
+        ((INTERACTIVE == 0)) || check_interactive_plan "$WORK/plan.json"
       fi
       cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
       event planned '' "$(jq '[.plan[]|select(.action=="update")]|length' "$WORK/plan.json") updates, $(jq '[.plan[]|select(.action=="prepare_target")]|length' "$WORK/plan.json") environments need a target build"

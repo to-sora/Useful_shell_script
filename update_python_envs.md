@@ -12,16 +12,46 @@ modules (`sysconfig`, `venv`, `pip`, and `pydoc`).
 Stop applications using the selected environments, then run as their owner:
 
 ```bash
+bash update_python_envs.sh
+```
+
+With no arguments, the updater discovers account-owned private installations and
+venvs on mounted SSD and memory filesystems, including installations outside
+`$HOME`. Existing `opt/python-*/bin/python*` installations and venv configurations
+provide the evidence; neither an installation registry nor changes to
+`install_python.sh` are required. An installation created with `--no-bashrc` or
+absent from PATH can be discovered by its files.
+
+The updater displays original paths, versions, planned actions and skip reasons.
+Press **Enter** (or `y`/`Y`) to approve the batch. Other answers cancel. EOF and
+Ctrl+C abort. Confirmation precedes target builds and environment changes; builds
+and checks receive EOF on stdin. Target preparation, backups, validation and
+rollback use the existing workflow and default paths.
+
+This mode requires each selected venv's original private base to be discovered
+and eligible at the same target version. A blocked or missing base aborts before
+changes. Raw installations update at their existing prefixes, and venvs keep
+their original base paths. Both staged/final checks and later journal verification
+enforce that relationship. A source directory named `python-3.11.13` keeps that
+name even when its interpreter becomes 3.11.18. Any package-snapshot failure
+aborts the interactive batch before publication.
+
+Interactive mode uses preinstalled dependencies and passes `--skip-apt --no-sudo`
+to target preparation, so it never asks for a sudo password. Missing tools,
+missing build dependencies or insufficient access produce a failed run with
+diagnostics. Automatic preparation uses the adjacent installer and therefore
+requires Ubuntu; other distributions need suitable preinstalled targets.
+
+Explicit commands retain scoped discovery, the `$HOME` default when roots are
+omitted, and per-venv `y`/`Y` confirmations. These commands can use separate target
+bases and remain suitable for advanced rebuild workflows:
+
+```bash
+bash update_python_envs.sh plan "$HOME"
 bash update_python_envs.sh apply "$HOME"
 ```
 
-This scans the root, reads the existing version pins from `install_python.sh`,
-reuses healthy cached or discovered private Python installations, and builds
-missing targets for branches that need an update. It then asks for `y` for each
-venv, backs up approved environments, applies the update and verifies the batch.
-Failed update validation triggers rollback. `--target` and `--output` are optional.
-
-Omitting roots defaults to `$HOME`. To bypass venv confirmations:
+To bypass venv confirmations in the explicit apply workflow:
 
 ```bash
 bash update_python_envs.sh -Y apply
@@ -34,7 +64,8 @@ version numbers; it does not install Python or update environments.
 
 ## Requirements and scope
 
-Use Bash 4+, GNU findutils/coreutils (including `tee`), awk, jq, rsync, and util-linux `flock`.
+Use Bash 4+, GNU findutils/coreutils (including `tee`), awk, jq, rsync, and
+util-linux `flock`, `findmnt` and `lsblk`.
 Use trusted roots owned by the invoking account: discovery executes candidate
 interpreters. Run without sudo. Host-root execution is rejected; a disposable
 container with the sole UID mapping `0 0 1` is the test exception.
@@ -48,7 +79,31 @@ implies `--skip-apt`. `--jobs N` controls compilation workers (default: 4).
 Other Linux distributions can use compatible preinstalled targets; the bundled
 source installer expects Ubuntu.
 
-The scan resolves each supplied root and walks its physical directories. It prunes
+### Storage-aware discovery
+
+Every scan/plan/apply inventories mounts with `findmnt` and backing devices with
+inverse `lsblk` trees. A rotational disk anywhere in a partition/LVM/RAID stack
+excludes that mount. SSD and tmpfs/ramfs mounts are eligible. Unknown media,
+loop devices, network filesystems, overlay filesystems and unsupported filesystem
+types are excluded rather than treated as SSD. This can exclude virtual/container
+storage whose physical disks are hidden. Classification reflects the information
+reported by the operating system, including virtual disks' reported ROTA values.
+`storage.json` beside the process log records every mount and its classification.
+
+Each physical walk uses `-xdev` and prunes nested mountpoints, including bind
+mounts. Eligible nested SSD mounts receive their own walk. HDD mounts and
+directory/interpreter links resolving to HDD receive no recursive search or
+interpreter probe. Venv config and library/base paths are checked before probing
+copied interpreters. These exclusions apply to explicit search roots as well.
+The inventory records storage skip reasons; inaccessible directories are recorded
+as discovery warnings. The report covers reachable, permitted storage, not
+unmounted or inaccessible environments.
+
+The no-argument workflow enumerates eligible mounts and probes account-owned
+private prefixes. System/runtime prefixes are pruned, and directory aliases are
+deduplicated by device/inode. The installer and existing shell setup are unchanged.
+
+For explicit commands, the scan resolves each supplied root and walks its physical directories. It prunes
 `.git`, `node_modules`, exclusions, and updater work directories. A directory link
 under a root is recorded in the inventory. To include an external environment,
 supply its directory or the link to it as another root. This handles aliases
@@ -112,7 +167,7 @@ overrides it. Each build gets a permanent `build-<timestamp>.<suffix>` directory
 and the cache's `targets.json` records its interpreter paths. Failed or unhealthy
 builds are replaced by a new build directory, never repaired in place underneath
 dependent venvs. Keep these directories while venvs reference them. Target
-preparation happens before venv confirmations and receives EOF on stdin;
+preparation in explicit `apply` commands happens before venv confirmations and receives EOF on stdin;
 declining an update can leave a prepared target for future use. A build failure
 aborts before modifying existing environments. A cache lock prevents concurrent
 builds in the same runtime directory.
@@ -156,7 +211,7 @@ bash update_python_envs.sh verify update-journal.json \
 bash update_python_envs.sh rollback update-journal.json
 ```
 
-Apply requires a separate `y` or `Y` for every venv selected for updating. Each
+An explicit `apply` command requires a separate `y` or `Y` for every venv selected for updating. Each
 prompt shows its path and old/target versions. Enter, `n`, or any other response
 skips that venv. End-of-input aborts the apply before any environment is changed,
 including when earlier prompts received `y`. Responses come from the original
@@ -167,6 +222,11 @@ blocks an update to its discovered raw base, so declining it cannot change its
 runtime indirectly. Approved peers can use the separate patch target instead.
 Raw installations do not receive a separate prompt. Roots and exclusions define
 discovery scope; dependent environments outside that scope are not prompted.
+
+The no-argument mode instead collects one Enter confirmation for the displayed
+batch before target preparation. Its approval includes raw installations, and
+requires retaining each selected venv's original base. Explicit commands retain
+the per-venv and separate-target behavior described above.
 
 Use `-Y` for unattended updates. The option is accepted before or after `apply`:
 
@@ -247,7 +307,7 @@ the final batch verification share the outer log. An explicit later verification
 or rollback starts a new log. The journal's `log_file` field locates its apply log.
 
 Discovery and planning snapshots are saved alongside `process.log` as
-`inventory.json` and `plan.json`; apply also saves `approved-plan.json` with the
+`storage.json`, `inventory.json` and `plan.json`; apply also saves `approved-plan.json` with the
 confirmation decisions. Use `--log-dir /path/to/logs` to choose another log root;
 the timestamp directory is created beneath it. A writable log destination is
 required before the operation starts. Logs inside a prefix selected for updating
@@ -256,6 +316,42 @@ dependencies are reported after logging starts. Logging itself needs GNU
 coreutils and Bash.
 
 ## Validation
+
+### November 12 interactive and storage revision
+
+The complete updater suite passed with private CPython 3.8.19 and 3.8.20 builds,
+including the control/log, automatic-target and interactive/storage drivers.
+Original paths, base references, package inventories, ACLs, xattrs, hard links,
+confirmation input and rollback were checked. The installer file matched the
+parent revision byte for byte.
+
+The test container hides its backing disks and its `/tmp` lacks ACL support.
+The full suite therefore used an ACL-capable workspace with a test-only mount
+classification fixture; the shipped unknown-storage exclusion was unchanged.
+Dedicated fixtures test HDD/SSD/LVM/RAID classifications and record the paths
+visited by real `find` commands. Target preparation uses the existing installer
+fixture with real CPython binaries; Ubuntu apt and installer source builds were
+not exercised by this revision.
+
+Bash syntax, repository ShellCheck 0.10.0 at error severity, and relevant shfmt
+3.8.0 checks passed. The separate repository coverage driver reached its legacy
+`nobody` ACL step and stopped because the container maps one UID. CI configuration
+is unchanged.
+
+`tests/python-updater-interactive.bash` tests mount/device classification using
+fixtures and real physical directory walks. It checks HDD interpreter/directory
+links, nested mounts, LVM, mixed RAID, bind aliases, unknown/loop/network storage,
+and copied venvs whose original base is on HDD. It can run without Python fixtures:
+
+```bash
+bash tests/python-updater-interactive.bash
+```
+
+When given old/patched private interpreters, it also exercises zero-argument
+Enter approval, cancellation/EOF before builds, legacy installs outside HOME and
+PATH, a separate SSD mount below an HDD mount, retained original bases and entry
+points, verification and rollback. This driver is included in the complete suite.
+Storage topology is simulated; tests do not attach, spin up or benchmark HDDs.
 
 The Bash regression suite takes two private interpreter binaries from the same
 minor branch. It creates disposable venvs, a partial backup, and an installation

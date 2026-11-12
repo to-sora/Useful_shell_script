@@ -76,6 +76,8 @@ Multi-version Python installer:
 - Installs dependencies via apt (unless `--skip-apt`)
 - Defaults to 3.11 and 3.13; use `--py` for explicit branch selection. Python 3.8 and 3.10 are end-of-life.
 - `update_python_envs.sh` scans, plans, applies, verifies, and rolls back private CPython patch updates.
+- `bash update_python_envs.sh` discovers existing account-owned installations on eligible mounted filesystems, shows the original-path plan, and accepts Enter before builds or updates. It requires original venv bases and preinstalled dependencies, without modifying the installer or shell setup.
+- Discovery excludes HDD-backed and unknown storage, including linked targets and nested mounts. `storage.json` records classifications; mixed HDD/SSD device stacks are excluded.
 - `bash update_python_envs.sh apply` defaults to scanning `$HOME`, using the installer pins, reusing healthy cached/discovered targets, and building needed targets. `--target` and `--output` are optional overrides; `plan` reports required builds without installing.
 - Prepared runtimes live under `${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater` (`--runtime-dir` overrides it). Keep the unique build directories while venvs use them. Default JSON outputs, including the recovery journal, are saved in the run's log directory.
 - Apply confirms each venv with `y`/`Y`; `-Y` bypasses prompts. Process logs default to `log/<UTC timestamp>.<suffix>/process.log` beside the updater; `--log-dir` changes the root.
