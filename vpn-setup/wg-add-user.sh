@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # Usage: ./wg-add-user.sh <LAST_OCTET>
 # Example: ./wg-add-user.sh 7  (Creates user with IP 10.8.0.7)
 
@@ -11,7 +12,7 @@ else
 fi
 
 # 2. Validate Input
-if [ -z "$1" ]; then
+if [[ ! ${1:-} =~ ^[1-9][0-9]{0,2}$ ]] || (( 10#$1 < 2 || 10#$1 > 254 )); then
     echo "Usage: $0 <LAST_OCTET>"
     echo "Example: $0 7"
     exit 1
@@ -57,20 +58,21 @@ echo "Created client config: $CONF_FILE"
 
 # 6. Update Server Config
 # Check if peer already exists to avoid duplicates
-if grep -q "$USER_IP" "$WG_CONFIG_PATH"; then
-    echo "Warning: IP $USER_IP seems to be already in $WG_CONFIG_PATH. Skipping append."
-else
-    cat >> "$WG_CONFIG_PATH" <<EOF
+temp_config=$(mktemp "${WG_CONFIG_PATH}.XXXXXX")
+trap 'rm -f -- "$temp_config"' EXIT
+awk -v ip="$USER_IP/32" 'BEGIN { RS="\\[Peer\\]"; FS="\n"; ORS="" } NR==1 { print; next } { for (i=1; i<=NF; i++) { line=$i; sub(/#.*/, "", line); gsub(/[[:space:]]/, "", line); if (line=="AllowedIPs=" ip) next } printf "[Peer]%s", $0 }' "$WG_CONFIG_PATH" > "$temp_config"
+cat >> "$temp_config" <<EOF
 
 [Peer]
 # $CLIENT_NAME
 PublicKey = $USER_PUB_KEY
 AllowedIPs = $USER_IP/32
 EOF
-    echo "Updated server config: $WG_CONFIG_PATH"
-fi
+mv -- "$temp_config" "$WG_CONFIG_PATH"
+echo "Updated server config: $WG_CONFIG_PATH"
 
 # 7. Apply Changes
 # Use syncconf to reload without disrupting current connections
-wg syncconf wg0 <(wg-quick strip wg0)
+WG_STRIPPED=$(wg-quick strip "$WG_CONFIG_PATH")
+wg syncconf wg0 /dev/stdin <<< "$WG_STRIPPED"
 echo "WireGuard configuration reloaded. Done."
