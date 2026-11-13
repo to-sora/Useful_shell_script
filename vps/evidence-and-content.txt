@@ -42,3 +42,10 @@ Independent review round 3:
 - Both reviewers confirmed request/proposal/implementation/documentation/evidence alignment and reported no material defects.
 
 Deliverable: four executable shell scripts, matching usage documentation, this evidence record, the proposal, and the isolated test suite under vps/. The scripts were created and tested; SSH service control and package installation were not applied to a VPS during authoring.
+
+Publication verification:
+- Implementation commit: 8ae1a67cc9d1ed36628c15f855ce219502074358 on codex/vps-tools.
+- Draft pull request: https://github.com/to-sora/Useful_shell_script/pull/9 .
+- All 12 remote file blobs matched their local Git blob hashes. The commit adds files under vps/ and changes zero existing files.
+- CI run 43437170743: immutable static analysis, shell tests/coverage, and coverage-report verification passed. Dependency Review passed in run 43437170702.
+- SonarQube publication stopped at the repository-token check: the job environment had an empty SONAR_TOKEN. Code/test stages completed before that step. This external credential setting is outside the VPS-script changes.
