@@ -7,13 +7,15 @@ export LC_ALL=C
 SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
 MARKER='.pyenv-update-'
 WORK=''
+PENDING_BUILD=''
 declare -a ROOTS=() EXCLUDES=() SCAN_ROOTS=() SCAN_EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
 declare -a PRUNE_PATHS=() TRUSTED_TARGETS=()
 declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
 ASSUME_YES=0
-INTERACTIVE=0 BATCH_APPROVED=0 STORAGE_READY=0
-declare -a MOUNT_PATHS=() MOUNT_CLASSES=()
+INTERACTIVE=0 STORAGE_READY=0
+HOME_ONLY_MOUNT=''
+declare -a MOUNT_PATHS=() MOUNT_CLASSES=() MOUNT_QUESTIONS=() MOUNT_APPROVED=()
 declare -A STORAGE_WARNED=()
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater"
 BUILD_JOBS=4
@@ -31,6 +33,9 @@ now() { date -u +%FT%TZ; }
 cleanup() {
   local status=$? pid
   trap - EXIT
+  if [[ -n $PENDING_BUILD ]]; then
+    rm -rf --one-file-system -- "$PENDING_BUILD" || printf 'Could not remove unfinished target build: %s\n' "$PENDING_BUILD" >&2
+  fi
   if ((LOGGING)); then
     printf '[%s] Finished %s (exit %s)\n' "$(now)" "$COMMAND" "$status" >&2
     # Close both writers before waiting, so the log is complete on return.
@@ -67,19 +72,24 @@ start_logging() {
 usage() {
   cat <<'HELP'
 Usage:
-  update_python_envs.sh                 # discover SSD installations, Enter to apply
+  update_python_envs.sh                 # discover and choose each environment
   update_python_envs.sh scan [ROOT...]
   update_python_envs.sh plan [ROOT...]
   update_python_envs.sh [-Y] apply [ROOT...]
   update_python_envs.sh verify JOURNAL
   update_python_envs.sh rollback JOURNAL
 
-With no arguments, discover private installations on mounted SSD/memory filesystems,
-show the plan and ask for Enter before preparing targets or changing environments.
-Original Python and venv base paths are required in this mode. No installer changes
-or installation registry are needed. Explicit commands retain their HOME default.
-HDD-backed and unknown storage (including link targets) is excluded from discovery.
+With no arguments, scan SSD/memory mounts and ask [y/N] for each uncertain local
+mount before discovery. Scan permission covers that mount for this run.
+If no mounts qualify and HOME is on a reported HDD, offer to scan HOME only.
+Review each Python installation, venv and Conda transaction. Answer y/yes to
+update that path or n/no/Enter to skip. All choices precede builds and writes.
+If a venv requires a different base, its prompt names that change.
+Explicit commands retain their HOME default.
+HDDs are excluded from automatic scans. Loops and unsupported filesystems
+are excluded. Explicit commands skip HDDs and uncertain media.
 Plan/apply use the adjacent installer's release pins.
+Conda installations use python_updater_conda.sh and their own Conda solver.
 Apply reuses healthy targets or builds missing branches, then updates environments.
 Plan reports required builds without installing. Installer --print-pins lists versions.
 Options: --target MINOR=/existing/bin/python (repeatable override),
@@ -91,8 +101,8 @@ Options: --target MINOR=/existing/bin/python (repeatable override),
 Automatic builds use install_python.sh with --skip-conda and --no-bashrc.
 Explicit commands may request a sudo password for Ubuntu dependencies/builds.
 No-argument mode requires preinstalled dependencies and uses --skip-apt --no-sudo.
-Apply asks for y/Y for each venv before changing any environment; other answers
-skip it. EOF aborts before updating. -Y before or after apply bypasses prompts.
+Explicit apply asks for each venv and Conda environment before changing any
+environment. EOF aborts before updating. -Y on explicit apply bypasses prompts.
 Each public command writes DIR/<UTC timestamp>.<unique suffix>/process.log.
 Journal, journal.entries and logs must be outside the updated prefixes.
 Discovery probes interpreter binaries within the supplied roots. Supply the
@@ -145,46 +155,74 @@ within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
 # Read the mount table once. Walking each mount with -xdev and pruning every
 # nested mount prevents even a directory traversal into an HDD/bind mount.
 # Inverse lsblk trees include the backing devices of partitions, LVM and RAID.
-# A single rotational member excludes the complete stack. Unknown/loop/network
-# storage is excluded rather than assuming that a missing ROTA value means SSD.
+# A known HDD or loop excludes the complete stack. An emulated disk's rotation
+# flag describes the guest interface; the operator can decide whether to scan it.
 load_storage() {
-  local path class
-  findmnt --json --list --output TARGET,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
-  if ! lsblk --json --inverse --output MAJ:MIN,ROTA,TYPE >"$WORK/block-devices.json" 2>"$WORK/lsblk-errors"; then
+  local path class question vm=false
+  if command -v systemd-detect-virt >/dev/null && systemd-detect-virt --vm --quiet </dev/null 2>/dev/null; then vm=true; fi
+  findmnt --json --list --uniq --output TARGET,SOURCE,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
+  if ! lsblk --json --inverse --tree --output NAME,MAJ:MIN,ROTA,TYPE,VENDOR,MODEL >"$WORK/block-devices.json"; then
+    printf 'Cannot read the block device tree; block-backed mounts will be classified as unknown.\n' >&2
     printf '{"blockdevices":[]}\n' >"$WORK/block-devices.json"
   fi
   jq -e '(.filesystems|type)=="array" and all(.filesystems[];
     (.target|type)=="string" and (.target|startswith("/")) and (.target|test("[\\t\\r\\n]")|not))' \
     "$WORK/mounts.json" >/dev/null || die 'Unsupported paths in mount inventory'
-  jq -n --slurpfile mounts "$WORK/mounts.json" --slurpfile devices "$WORK/block-devices.json" '
+  jq -n --argjson vm "$vm" --slurpfile mounts "$WORK/mounts.json" --slurpfile devices "$WORK/block-devices.json" '
     def backing: recurse(.children[]?);
+    def rotational: .rota==true or .rota==1 or .rota=="1";
+    def virtual_disk:
+      .type=="disk" and (
+        ((.name // "")|test("^(xvd|vd)[a-z]+$")) or
+        ([.vendor,.model]|join(" ")|test("QEMU|VMware|VBOX|VirtIO|Xen|Parallels|Virtual[ _-]*(Disk|HD)|Elastic Block Store|Persistent[ _-]*Disk";"i")) or
+        ($vm and ((.model // "")|test("^\\s*(unknown|generic|scsi disk|disk)?\\s*$";"i"))));
     def disk_class:
-      if any(backing; .rota==true or .rota==1 or .rota=="1") then "hdd"
-      elif any(backing; .type=="loop" or (.rota!=false and .rota!=0 and .rota!="0")) then "unknown"
+      if any(backing; .type=="loop" or ((.["maj:min"] // "")|startswith("7:"))) then "loop"
+      elif any(backing; .type=="disk" and rotational and (virtual_disk|not)) then "hdd"
+      elif any(backing; rotational) then
+        if any(backing; virtual_disk) or ($vm and all(backing; .type!="disk"))
+        then "virtual-hdd" else "hdd" end
+      elif any(backing; (.rota!=false and .rota!=0 and .rota!="0")
+               or ((.children|length)==0 and .type!="disk")) then "unknown"
       else "ssd" end;
+    def mount_class($disk):
+      if (.fstype=="tmpfs" or .fstype=="ramfs") then {class:"memory",reason:"memory filesystem"}
+      elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$")|not)
+        then {class:"unknown",reason:"filesystem type excluded from discovery"}
+      elif $disk=="loop" or ((.["maj:min"] // "")|startswith("7:")) or
+           ((.source // "")|test("^/dev/loop[0-9]+(p[0-9]+)?($|\\[)"))
+        then {class:"unknown",reason:"loop-backed mount"}
+      elif $disk=="hdd" then {class:"hdd",reason:"device stack reports rotational media"}
+      elif $disk=="virtual-hdd" then {class:"hdd",ask:true,reason:"virtual disk reports rotation; host media unknown"}
+      elif $disk=="ssd" then {class:"ssd",reason:"device stack reports non-rotational disks"}
+      elif $disk=="unknown" then {class:"unknown",ask:true,reason:"incomplete backing disk or rotation information"}
+      else {class:"unknown",ask:true,reason:"mount device ID absent from the block device tree"} end;
     [$devices[0].blockdevices[]? | backing | {device:.["maj:min"],class:disk_class}]
     | group_by(.device) | map({key:.[0].device,value:
-        (if any(.[];.class=="hdd") then "hdd"
+        (if any(.[];.class=="loop") then "loop"
+         elif any(.[];.class=="hdd") then "hdd"
+         elif any(.[];.class=="virtual-hdd") then "virtual-hdd"
          elif any(.[];.class=="unknown") then "unknown" else "ssd" end)}) | from_entries as $disks
-    | [$mounts[0].filesystems[] | {path:.target, filesystem:.fstype,
-        class:(if (.fstype=="tmpfs" or .fstype=="ramfs") then "memory"
-          elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$"))
-          then ($disks[.["maj:min"]] // "unknown") else "unknown" end)}]
+    | [$mounts[0].filesystems[] | (.["maj:min"] // "") as $id |
+        {path:.target, filesystem:.fstype, device:$id} + mount_class($disks[$id])]
     | sort_by(.path|length) | reverse' >"$WORK/storage.json" || die 'Invalid storage inventory'
-  MOUNT_PATHS=() MOUNT_CLASSES=()
-  while IFS= read -r -d '' path && IFS= read -r -d '' class; do
+  MOUNT_PATHS=() MOUNT_CLASSES=() MOUNT_QUESTIONS=() MOUNT_APPROVED=()
+  while IFS= read -r -d '' path && IFS= read -r -d '' class && IFS= read -r -d '' question; do
     MOUNT_PATHS+=("$path")
     MOUNT_CLASSES+=("$class")
-  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000"' "$WORK/storage.json")
+    MOUNT_QUESTIONS+=("$question")
+  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000",(.ask // false|tostring),"\u0000"' "$WORK/storage.json")
   STORAGE_READY=1
   cp -- "$WORK/storage.json" "$LOG_DIR/storage.json"
 }
 storage_class() {
   local path=$1 i
-  STORAGE_CLASS=unknown
+  STORAGE_CLASS=unknown STORAGE_APPROVED=0 STORAGE_MOUNT_INDEX=''
   for i in "${!MOUNT_PATHS[@]}"; do
     if within "$path" "${MOUNT_PATHS[$i]}"; then
       STORAGE_CLASS=${MOUNT_CLASSES[$i]}
+      STORAGE_MOUNT_INDEX=$i
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]] && within "$path" "${MOUNT_APPROVED[$i]}"; then STORAGE_APPROVED=1; fi
       break
     fi
   done
@@ -193,7 +231,11 @@ storage_allowed() {
   local path=$1
   ((STORAGE_READY)) || return 0
   storage_class "$path"
-  [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory ]]
+  if [[ -n $HOME_ONLY_MOUNT ]]; then
+    [[ $STORAGE_MOUNT_INDEX == "$HOME_ONLY_MOUNT" && $STORAGE_APPROVED == 1 ]]
+    return
+  fi
+  [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory || $STORAGE_APPROVED == 1 ]]
 }
 storage_warning() {
   local path=$1
@@ -203,17 +245,82 @@ storage_warning() {
   warning "$path" "Storage excluded: $STORAGE_CLASS"
   event storage_skipped "$path" "$STORAGE_CLASS"
 }
+ask_scan_mount() {
+  local i=$1 mount=${MOUNT_PATHS[$1]} scope=$2 answer choice
+  jq -r --arg mount "$mount" 'first(.[]|select(.path==$mount)) |
+    "\(.path) (\(.filesystem), device \(.device), class \(.class): \(.reason))"' "$LOG_DIR/storage.json" >&2
+  while true; do
+    printf 'Scan %s for Python environments? [y/N] ' "$scope" >&2
+    if ! IFS= read -r answer; then
+      printf '\n' >&2
+      choice=input_ended
+      break
+    fi
+    case "${answer,,}" in
+      y | yes) choice=approved; break ;;
+      '' | n | no) choice=skipped; break ;;
+      *) printf 'Enter y to scan or n to skip.\n' >&2 ;;
+    esac
+  done
+  json_edit "$LOG_DIR/storage.json" --arg mount "$mount" --arg scope "$scope" --arg choice "$choice" \
+    'map(if .path==$mount then .+{scan_scope:$scope,scan_choice:$choice} else . end)'
+  event storage_choice "$scope" "$choice"
+  case "$choice" in
+    approved) MOUNT_APPROVED[$i]=$scope ;;
+    input_ended) die "Storage selection ended before discovery. Storage inventory: $LOG_DIR/storage.json" ;;
+  esac
+}
 automatic_roots() {
-  local path i
+  local path i home asked=0
   ROOTS=()
   for i in "${!MOUNT_PATHS[@]}"; do
     path=${MOUNT_PATHS[$i]}
     case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) continue ;; esac
     protected "$path" && continue
     if within "$path" "$RUNTIME_DIR" || within "$path" "$LOG_ROOT"; then continue; fi
-    case "${MOUNT_CLASSES[$i]}" in ssd | memory) ROOTS+=("$path") ;; esac
+    if [[ ${MOUNT_QUESTIONS[$i]} == true ]]; then
+      [[ -d $path ]] || continue
+      if ((asked == 0)); then
+        printf '\nSelect trusted mounts for discovery. Scanning runs candidate Python interpreters. Updates require a separate confirmation.\n' >&2
+      fi
+      asked=1
+      ask_scan_mount "$i" "$path"
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]]; then ROOTS+=("$path"); fi
+    elif [[ ${MOUNT_CLASSES[$i]} == ssd || ${MOUNT_CLASSES[$i]} == memory ]]; then
+      if [[ -d $path ]]; then ROOTS+=("$path"); fi
+    fi
   done
-  ((${#ROOTS[@]})) || die 'No SSD or memory filesystems available for discovery; see storage.json'
+  if ((${#ROOTS[@]} == 0)); then
+    if ((asked)); then
+      event no_scan '' 'All offered mounts were skipped'
+      return 0
+    fi
+    home="$(realpath -m -- "$HOME")"
+    storage_class "$home"
+    if [[ $STORAGE_CLASS == hdd && $home != / && -d $home ]] && walk_root_allowed "$home" &&
+      ! within "$home" "$RUNTIME_DIR" && ! within "$home" "$LOG_ROOT"; then
+      i=$STORAGE_MOUNT_INDEX
+      printf '\nNo automatic scan roots. The home mount reports rotational media.\n' >&2
+      printf 'Only %s on this mount is offered. Scanning runs candidate Python interpreters. Updates require a separate confirmation.\n' "$home" >&2
+      printf 'Storage inventory: %s/storage.json\n' "$LOG_DIR" >&2
+      ask_scan_mount "$i" "$home"
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]]; then
+        HOME_ONLY_MOUNT=$i
+        ROOTS+=("$home")
+      else
+        event no_scan "$home" 'Home scan skipped'
+      fi
+      return 0
+    fi
+    # storage.json is ordered by descending mount path length. Use the same
+    # path boundary as storage_class, including when HOME is on the root mount.
+    jq -r --arg home "$home" '
+      first(.[] | .path as $mount | select($home==$mount or
+        ($home|startswith(($mount|rtrimstr("/"))+"/")))) |
+      "Home \($home): mount \(.path), filesystem \(.filesystem), device \(.device), class \(.class) (\(.reason))."
+    ' "$LOG_DIR/storage.json" >&2
+    die "No eligible SSD or memory directory mounts for discovery. Storage inventory: $LOG_DIR/storage.json"
+  fi
 }
 assert_control_paths() {
   local prefixes=$1 path resolved prefix
@@ -240,10 +347,13 @@ runpy() {
   local name
   local -a environment=(env -u VIRTUAL_ENV -u CONDA_PREFIX)
   for name in ${!PYTHON@}; do environment+=(-u "$name"); done
-  timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@"
+  timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@" </dev/null
 }
 config_value() {
-  awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= \"/, "");sub(/\"$/, "");print;exit}' "$1"
+  awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= "/, "");sub(/"$/, "");print;exit}' "$1"
+}
+venv_home() {
+  awk '/^home[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$1"
 }
 # The sysconfig module CLI supplies identity and ABI without inline code.
 probe() {
@@ -267,7 +377,7 @@ probe() {
   bits="$(config_value "$report" SIZEOF_VOID_P)"
   pure="$(config_value "$report" purelib)"
   plat="$(config_value "$report" platlib)"
-  machine="$(awk '/^Platform:/ {sub(/^Platform: \"/, "");sub(/\"$/, "");print;exit}' "$report")"
+  machine="$(awk '/^Platform:/ {sub(/^Platform: "/, "");sub(/"$/, "");print;exit}' "$report")"
   rm -f -- "$report"
   [[ $prefix == /* && $base == /* && $abi == cpython-* && $bits =~ ^[0-9]+$ && $shared =~ ^[01]$ ]] || return 1
   prefix="$(canonical "$prefix")"
@@ -372,12 +482,13 @@ scan() {
       jq -cn --arg path "$root" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
     fi
   done
-  # A selected SSD root can contain other SSD mountpoints. Add those roots
+  # A selected root can contain other eligible mountpoints. Add those roots
   # explicitly; each individual walk still stops at every mount boundary.
   for root in "${SCAN_ROOTS[@]}"; do
     for mount in "$root" "${MOUNT_PATHS[@]}"; do
       within "$mount" "$root" && storage_allowed "$mount" || continue
       walk_root_allowed "$mount" || continue
+      [[ $mount == "$root" || -d $mount ]] || continue
       [[ ! ${walk_seen[$mount]+yes} ]] || continue
       walk_seen[$mount]=1
     done
@@ -438,7 +549,7 @@ scan() {
         storage_warning "$resolved"
         continue
       fi
-      base="$(awk '/^home[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$prefix/pyvenv.cfg")"
+      base="$(venv_home "$prefix/pyvenv.cfg")"
     fi
     flag=0
     for root in "$prefix/lib" "$prefix/lib64" "$base"; do
@@ -481,6 +592,7 @@ scan() {
       continue
     fi
     identities[$identity]=$prefix
+    info="$(jq -c --arg id "$identity" '.prefix_identity=$id' <<<"$info")"
     base="$(jq -r .base_prefix <<<"$info")"
     if scan_path_allowed "$(realpath -m -- "$base/bin/python$(minor "$(jq -r .version <<<"$info")")")"; then
       jq -c '.+{base_in_scope:true}' <<<"$info" >>"$WORK/probes.ndjson"
@@ -516,7 +628,8 @@ target_info() {
 remember_target() {
   local mm=$1 info=$2 source=$3 prefix
   prefix="$(jq -r .prefix <<<"$info")"
-  json_edit "$WORK/targets.json" --arg mm "$mm" --arg source "$source" --argjson info "$info" '.[$mm]=$info+{minor:$mm,source:$source}'
+  json_edit "$WORK/targets.json" --arg mm "$mm" --arg source "$source" --argjson info "$info" \
+    '.[$mm][($info.shared|tostring)]=$info+{minor:$mm,source:$source}'
   PRUNE_PATHS+=("$prefix")
   TRUSTED_TARGETS+=("$prefix")
   event target_selected "$prefix" "$mm ($source)"
@@ -550,19 +663,19 @@ healthy_target() {
 }
 load_cached_targets() {
   local mm path info
+  if ((INTERACTIVE)) && ! storage_allowed "$(realpath -m -- "$RUNTIME_DIR/targets.json")"; then return 0; fi
   [[ -f $RUNTIME_DIR/targets.json ]] || return 0
   jq -e 'type=="object" and all(.[];type=="string")' "$RUNTIME_DIR/targets.json" >/dev/null || die 'Invalid runtime cache targets.json'
   for mm in "${!POLICY[@]}"; do
     jq -e --arg mm "$mm" 'has($mm)' "$WORK/targets.json" >/dev/null && continue
-    path="$(jq -r --arg mm "$mm" '.[$mm]//empty' "$RUNTIME_DIR/targets.json")"
-    [[ -n $path ]] || continue
-    # Cache pointers cannot grant discovery access outside the chosen cache.
-    within "$(realpath -m -- "$path")" "$RUNTIME_DIR" || die "Cached target escapes runtime directory: $path"
-    if info="$(target_info "$mm" "$path")" && within "$(jq -r .prefix <<<"$info")" "$RUNTIME_DIR" && healthy_target "$path"; then
-      remember_target "$mm" "$info" cache
-    else
-      event target_unusable "$path" 'A fresh target will be prepared if needed'
-    fi
+    while IFS= read -r path; do
+      within "$(realpath -m -- "$path")" "$RUNTIME_DIR" || die "Cached target escapes runtime directory: $path"
+      if info="$(target_info "$mm" "$path")" && within "$(jq -r .prefix <<<"$info")" "$RUNTIME_DIR" && healthy_target "$path"; then
+        remember_target "$mm" "$info" cache
+      else
+        event target_unusable "$path" 'A fresh target will be prepared if needed'
+      fi
+    done < <(jq -r --arg mm "$mm" '[.[$mm],.[$mm+":shared=0"],.[$mm+":shared=1"]]|map(select(.!=null))|unique[]' "$RUNTIME_DIR/targets.json")
   done
 }
 discover_targets() {
@@ -572,18 +685,40 @@ discover_targets() {
     info="$(jq -c --arg path "$path" '.environments[]|select(.binary==$path)' "$inventory")"
     mm="$(minor "$(jq -r .version <<<"$info")")"
     [[ ${POLICY[$mm]+yes} ]] || continue
-    jq -e --arg mm "$mm" 'has($mm)' "$WORK/targets.json" >/dev/null && continue
+    jq -e --arg mm "$mm" --argjson i "$info" '.[$mm] as $v |
+      $v[($i.shared|tostring)]!=null or any($v[]?;.source=="explicit")' "$WORK/targets.json" >/dev/null && continue
     prefix="$(jq -r .prefix <<<"$info")"
     protected "$prefix" && continue
     if info="$(target_info "$mm" "$path")" && healthy_target "$path"; then remember_target "$mm" "$info" discovered; fi
   done < <(jq -r '.environments|map(select(.kind=="raw" and .managed=="private" and (.versions|length)==1))|
     sort_by(.version|split(".")|map(tonumber))|reverse|.[].binary' "$inventory")
 }
+check_build_space() {
+  local version=$1 report available total_inodes free_inodes
+  # One source tree, its objects and its installed runtime coexist until validation.
+  local min_bytes=$((1024 * 1024 * 1024)) min_inodes=16000 inode_short=0
+  report=$(df -B1 --output=avail,itotal,iavail -- "$RUNTIME_DIR") || die "Cannot measure build space at $RUNTIME_DIR"
+  read -r available total_inodes free_inodes <<< "${report##*$'\n'}"
+  [[ $available =~ ^-?[0-9]+$ ]] || die "Cannot read available bytes at $RUNTIME_DIR"
+  # Some filesystems allocate inodes dynamically and report zero or '-' for their total.
+  if [[ $total_inodes =~ ^[1-9][0-9]*$ && $free_inodes =~ ^-?[0-9]+$ ]]; then
+    ((free_inodes >= min_inodes)) || inode_short=1
+  else
+    free_inodes=unreported
+  fi
+  printf 'Python %s build at %s: %s bytes available, free inodes: %s. Build estimate: %s bytes (1 GiB) and %s inodes.\n' \
+    "$version" "$RUNTIME_DIR" "$available" "$free_inodes" "$min_bytes" "$min_inodes" >&2
+  if ((available >= min_bytes && inode_short == 0)); then return 0; fi
+  if [[ ${PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE:-} == 1 ]] && ((available > 0)) && { ((inode_short == 0)) || ((free_inodes > 0)); }; then
+    printf 'Proceeding below the estimate at operator request (PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1).\n' >&2
+    return 0
+  fi
+  die "Insufficient build space for Python $version at $RUNTIME_DIR. Free space there or set XDG_DATA_HOME to a directory on an approved mount (--runtime-dir for explicit apply). Existing environments were not updated."
+}
 prepare_targets() {
-  local plan=$1 mm build_dir path info fd
-  local -a needed=() options=(--reuse --skip-conda --no-bashrc --jobs "$BUILD_JOBS")
-  mapfile -t needed < <(jq -r '[.plan[]|select(.action=="prepare_target")|.version|split(".")[0:2]|join(".")]|unique[]' "$plan")
-  ((${#needed[@]})) || return 0
+  local plan=$1 mm build_dir path info fd shared skip_apt=$SKIP_APT
+  local -a needed options=(--reuse --skip-conda --no-bashrc --jobs "$BUILD_JOBS") build_options
+  jq -e 'any(.plan[];.action=="prepare_target")' "$plan" >/dev/null || return 0
   jq '[.plan[]|select(.action!="skip")]' "$plan" >"$WORK/control-prefixes.json"
   assert_control_paths "$WORK/control-prefixes.json" "$OUTPUT" "$OUTPUT.entries" "$OUTPUT.post-verify.json" "$LOG_DIR" "$WORK" "$RUNTIME_DIR"
   [[ ! -e $OUTPUT && ! -L $OUTPUT && ! -e $OUTPUT.entries && ! -L $OUTPUT.entries ]] || die 'Journal exists; choose a new output path'
@@ -592,22 +727,41 @@ prepare_targets() {
   flock -n "$fd" || die "Another updater is preparing targets in $RUNTIME_DIR"
   # Each build has a permanent, unique prefix. An interrupted or unhealthy
   # cached build is never rebuilt in place underneath an existing venv.
-  build_dir="$(mktemp -d "$RUNTIME_DIR/build-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
-  ((SKIP_APT == 0)) || options+=(--skip-apt)
   ((NO_SUDO == 0)) || options+=(--no-sudo)
-  event target_build_started "$build_dir" "${needed[*]}"
-  bash "${SELF%/*}/install_python.sh" "$build_dir" "${options[@]}" --py "${needed[*]}" </dev/null || die 'Target preparation failed; existing environments were not updated'
-  for mm in "${needed[@]}"; do
-    path="$build_dir/opt/python-${POLICY[$mm]}/bin/python$mm"
-    info="$(target_info "$mm" "$path")" && healthy_target "$path" || die "Prepared target failed validation: $path"
-    remember_target "$mm" "$info" installed
+  for shared in 0 1; do
+    mapfile -t needed < <(jq -r --argjson shared "$shared" '[.plan[]|select(.action=="prepare_target" and .shared==$shared)|
+      .version|split(".")[0:2]|join(".")]|unique[]' "$plan")
+    ((${#needed[@]})) || continue
+    for mm in "${needed[@]}"; do
+      check_build_space "${POLICY[$mm]}"
+      build_dir="$(mktemp -d "$RUNTIME_DIR/build-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+      PENDING_BUILD=$build_dir
+      mkdir -- "$build_dir/src"
+      build_options=("${options[@]}")
+      ((shared == 0)) || build_options+=(--enable-shared)
+      ((skip_apt == 0)) || build_options+=(--skip-apt)
+      event target_build_started "$build_dir" "$mm (shared=$shared)"
+      if ! TMPDIR="$build_dir/src" bash "${SELF%/*}/install_python.sh" "$build_dir" "${build_options[@]}" --py "$mm" </dev/null; then
+        df -B1 --output=target,avail,iavail -- "$build_dir" >&2 || true
+        die "Target preparation failed; existing environments were not updated (Python ${POLICY[$mm]}, build directory $build_dir)"
+      fi
+      skip_apt=1
+      path="$build_dir/opt/python-${POLICY[$mm]}/bin/python$mm"
+      info="$(target_info "$mm" "$path")" && [[ $(jq -r .shared <<<"$info") == "$shared" ]] && healthy_target "$path" || die "Prepared target failed validation: $path"
+      remember_target "$mm" "$info" installed
+      rm -rf --one-file-system -- "$build_dir/src" || printf 'Could not remove build intermediates: %s/src\n' "$build_dir" >&2
+      # Once a cache write can refer to this runtime, cleanup must preserve it,
+      # including on interruption between atomic rename and filesystem sync.
+      PENDING_BUILD=''
+      if [[ ! -f $RUNTIME_DIR/targets.json ]]; then printf '{}\n' | atomic_write "$RUNTIME_DIR/targets.json"; fi
+      json_edit "$RUNTIME_DIR/targets.json" --arg mm "$mm" --arg path "$path" --arg shared "$shared" \
+        --slurpfile selected "$WORK/targets.json" '
+        reduce ($selected[0][$mm][]|select(.source=="cache")) as $t (.;
+          .[$mm+":shared="+($t.shared|tostring)]=$t.binary)
+        | .[$mm]=$path | .[$mm+":shared="+$shared]=$path'
+      event target_build_finished "$build_dir" "$mm (shared=$shared)"
+    done
   done
-  [[ -f $RUNTIME_DIR/targets.json ]] || printf '{}\n' | atomic_write "$RUNTIME_DIR/targets.json"
-  for mm in "${needed[@]}"; do
-    path="$(jq -r --arg mm "$mm" '.[$mm].binary' "$WORK/targets.json")"
-    json_edit "$RUNTIME_DIR/targets.json" --arg mm "$mm" --arg path "$path" '.[$mm]=$path'
-  done
-  event target_build_finished "$build_dir" "${needed[*]}"
   exec {fd}>&-
 }
 protected() {
@@ -617,15 +771,23 @@ protected() {
   done
   return 1
 }
+load_conda_support() {
+  declare -F conda_plan_item >/dev/null && return 0
+  [[ -r ${SELF%/*}/python_updater_conda.sh ]] || return 1
+  source "${SELF%/*}/python_updater_conda.sh"
+}
 make_plan() {
-  local inventory=$1 destination=$2 item prefix kind version mm target reason candidate newer flag unresolved name patch outside action older requested
+  local inventory=$1 destination=$2 item prefix kind managed version mm target reason candidate newer flag unresolved name patch outside action older requested conda_item
   : >"$WORK/plan.ndjson"
+  touch "$WORK/conda-plans.ndjson"
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
     kind="$(jq -r .kind <<<"$item")"
+    managed="$(jq -r .managed <<<"$item")"
     version="$(jq -r .version <<<"$item")"
     mm=$(minor "$version")
-    target="$(jq -c --arg mm "$mm" '.[$mm]//null' "$WORK/targets.json")"
+    target="$(jq -c --arg mm "$mm" --argjson i "$item" '.[$mm] as $v |
+      $v[($i.shared|tostring)] // first($v[]? | select(.source=="explicit")) // null' "$WORK/targets.json")"
     reason=''
     action=update
     requested=${POLICY[$mm]:-}
@@ -643,8 +805,8 @@ make_plan() {
         if is_standard "$name" "$mm"; then flag=1; else unresolved="$(jq -c --arg name "$name" '.+[$name]' <<<"$unresolved")"; fi
       fi
     done < <(find "$prefix/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
-    if [[ $(jq -r .managed <<<"$item") != private ]]; then
-      reason='Conda-managed prefix/cache: use the Conda solver'
+    if [[ $managed == conda-package-cache ]]; then
+      reason='Conda package cache'
     elif protected "$prefix"; then
       reason='Distribution/runtime-managed prefix'
     elif [[ -L $prefix/bin || -L $prefix/lib ]]; then
@@ -657,6 +819,17 @@ make_plan() {
       reason='Multiple minor branches share a prefix'
     elif [[ $(stat -Lc %u -- "$prefix") != "$EUID" || ! -w $(dirname -- "$prefix") ]]; then
       reason='Prefix ownership or parent write access does not permit updating'
+    elif [[ $managed == conda ]]; then
+      if load_conda_support; then
+        conda_item="$(jq -sc --arg p "$prefix" 'first(.[] | select(.prefix==$p)) // empty' "$WORK/conda-plans.ndjson")"
+        if [[ -z $conda_item ]]; then
+          conda_item="$(conda_plan_item "$item" "$inventory")"
+          printf '%s\n' "$conda_item" >>"$WORK/conda-plans.ndjson"
+        fi
+        printf '%s\n' "$conda_item" >>"$WORK/plan.ndjson"
+        continue
+      fi
+      reason='Conda updates require the adjacent python_updater_conda.sh'
     elif [[ $target == null ]]; then
       if [[ -z $requested ]]; then
         reason="No tested release policy for Python $mm"
@@ -699,104 +872,178 @@ make_plan() {
       '.+{target:$target,requested_version:$requested,eol:$eol,unresolved_aliases:$unresolved,action:$action,reason:$reason}' <<<"$item" >>"$WORK/plan.ndjson"
   done < <(jq -c '.environments[]' "$inventory")
   jq -n --slurpfile inventory "$inventory" --slurpfile plan "$WORK/plan.ndjson" \
-    '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
+    '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind=="venv",.prefix))}' | atomic_write "$destination"
 }
 
-# Interactive updates keep the original raw base. The advanced, explicitly
-# scoped commands retain their separate-target behavior for rebuild workflows.
-require_original_bases() {
-  local plan=$1 errors
-  errors="$(jq -r '
-    .plan as $all | .plan[] | select(.action=="update" or .action=="prepare_target") |
-    if .kind=="venv" then . as $venv |
-      [$all[]|select(.kind=="raw" and .prefix==$venv.base_prefix and
-        (.action=="update" or .action=="prepare_target" or .reason=="up_to_date") and
-        (.target.version//.requested_version)==($venv.target.version//$venv.requested_version))] |
-      if length==1 then empty else "Original base unavailable for " + $venv.prefix + ": " + $venv.base_prefix end
-    else . as $raw | $all[] | select(.kind=="venv" and .base_prefix==$raw.prefix and .action=="skip") |
-      "Dependent venv blocks original base " + $raw.prefix + ": " + .prefix + " (" + .reason + ")" end' "$plan")"
-  [[ -z $errors ]] || die "$errors"
-  json_edit "$plan" '.plan |= map(if .kind=="venv" and (.action=="update" or .action=="prepare_target")
-    then .required_base=.base_prefix else . end)'
+# Reapply the same individual choices to both the initial and post-build plans.
+# A declined venv protects its base even when a different venv was approved.
+selected_plan() {
+  local candidates=$1 destination=$2
+  jq --slurpfile choices "$WORK/choices.ndjson" '
+    def pending: .action=="update" or .action=="prepare_target";
+    def goal: if .reason=="up_to_date" then .version else .target.version // .requested_version end;
+    def abi: [.soabi,.shared,.pointer_bits,.machine];
+    def conda_provider($v): .kind=="conda" and $v.base_in_scope and (pending or .reason=="up_to_date") and
+      goal==($v|goal) and abi==($v|abi);
+    ($choices|INDEX(.prefix)) as $choices | .inventory.warnings as $warnings |
+    .plan |= map($choices[.prefix] as $choice |
+      if $choice==null then .
+      else .approval=$choice.approval |
+        (if $choice.base_choice!=null then .base_choice=$choice.base_choice else . end) |
+        if .approval=="declined" then .action="skip" | .reason=$choice.reason else . end
+      end) |
+    .plan as $all | .plan |= map(. as $base |
+      if .kind!="venv" and pending and any($all[]; . as $v |
+          .kind=="venv" and .base_prefix==$base.prefix and (goal!=($base|goal) or
+          (.action=="skip" and (.reason!="Interpreter ABI/build mismatch" or ($base|conda_provider($v)|not)))))
+      then .action="skip" | .reason="Dependent venv requires the original base to remain unchanged"
+      else . end) |
+    (.plan | map(select(.kind!="venv")) | INDEX(.prefix)) as $bases |
+    .plan |= map(. as $v | $bases[.base_prefix] as $base |
+      if .kind=="venv" and (pending or (.reason=="Interpreter ABI/build mismatch" and ($base|conda_provider($v)))) then
+      if .base_choice=="replacement" then .required_base=.target.prefix
+      elif ($base|conda_provider($v))
+      then .target=($base|{prefix,binary,version:goal,source:"original-conda"}) |
+        .action="update" | .reason="Use the Conda interpreter at the original base" | .required_base=.base_prefix
+      elif .target.prefix==.base_prefix or
+        ($base!=null and (($base|pending) or $base.reason=="up_to_date") and ($base|goal)==goal)
+      then .required_base=.base_prefix
+      else .base_issue=(if $base!=null then ($base.reason|select(length>0)) // "Original base has a different target version"
+        else ([$warnings[]? | select(.path==$v.base_prefix or (.path|startswith($v.base_prefix+"/bin/"))) | .reason] | unique | join(". ")) as $why |
+          if $why=="" then "Original base has no raw installation in the scan" else $why end end)
+      end else . end)' "$candidates" | atomic_write "$destination"
+}
+ask_environment() {
+  local item=$1 input_fd=$2 answer reason
+  local kind prefix current target
+  kind="$(jq -r .kind <<<"$item")"
+  prefix="$(jq -r .prefix <<<"$item")"
+  current="$(jq -r .version <<<"$item")"
+  target="$(jq -r '.target.version//.requested_version' <<<"$item")"
+  printf '\nUpdate %s %s (%s -> %s)\n' "$kind" "$prefix" "$current" "$target" >&2
+  if [[ $kind == conda ]]; then
+    jq -r '"Conda package changes: "+.conda.summary' <<<"$item" >&2
+  elif [[ $kind == venv ]]; then
+    reason="$(jq -r '.base_issue//empty' <<<"$item")"
+    jq -r --arg reason "$reason" '"Original base: "+.base_prefix+
+      (if $reason=="" then "" else " ("+$reason+")" end)' <<<"$item" >&2
+    if [[ -n $reason ]]; then
+      jq -r --arg cache "$RUNTIME_DIR" '"Replacement base: Python "+(.target.version//.requested_version)+", "+
+        (.target.prefix//("a new private runtime under "+$cache))' <<<"$item" >&2
+    elif ((INTERACTIVE==0)); then
+      jq -r '"Target if the original base cannot provide this version: "+.target.prefix' <<<"$item" >&2
+    fi
+  fi
+  while true; do
+    if [[ -n ${reason:-} ]]; then
+      printf 'Update this venv at its existing path using the replacement base? [y/N] ' >&2
+    else
+      printf 'Update this %s at its existing path? [y/N] ' "$kind" >&2
+    fi
+    if ! IFS= read -r -u "$input_fd" answer; then
+      printf '\n' >&2
+      die 'Confirmation input ended; no environments updated'
+    fi
+    case "${answer,,}" in
+      y|yes) ENV_APPROVAL=confirmed; break ;;
+      ''|n|no) ENV_APPROVAL=declined; break ;;
+      *) printf 'Enter y/yes to update or n/no to skip.\n' >&2 ;;
+    esac
+  done
+  if [[ $ENV_APPROVAL == confirmed ]]; then event confirmation "$prefix" approved; else event confirmation "$prefix" declined; fi
+}
+collect_choices() {
+  local plan=$1 phase=$2 item prefix base_choice reason input_fd ENV_APPROVAL
+  exec {input_fd}<&0
+  while IFS= read -r item; do
+    ask_environment "$item" "$input_fd"
+    prefix="$(jq -r .prefix <<<"$item")"
+    base_choice=null
+    reason='Environment update declined'
+    if jq -e '.base_issue!=null' <<<"$item" >/dev/null; then
+      if [[ $ENV_APPROVAL == confirmed ]]; then base_choice='"replacement"'; else base_choice='"skipped"'; fi
+      reason='Replacement base declined'
+    fi
+    jq -cn --arg p "$prefix" --arg a "$ENV_APPROVAL" --argjson b "$base_choice" --arg r "$reason" \
+      '{prefix:$p,approval:$a,base_choice:$b,reason:$r}' >>"$WORK/choices.ndjson"
+  done < <(jq -c --arg phase "$phase" '.plan[]|select(.action=="update" or .action=="prepare_target")|
+    select(if $phase=="installations" then .kind!="venv"
+      elif $phase=="venvs" then .kind=="venv"
+      else .kind=="venv" and .approval=="confirmed" and .base_issue!=null and .base_choice==null end)' "$plan")
+  exec {input_fd}<&-
 }
 confirm_interactive() {
-  local plan=$1 answer count
-  printf '\nDiscovered environments (original paths are retained):\n' >&2
-  jq -r '.plan[]|[.kind,.prefix,(.version+" -> "+(.target.version//.requested_version)),.action,.reason]|@tsv' "$plan" >&2
+  local plan=$1 selected="$WORK/selection.json" phase
+  : >"$WORK/choices.ndjson"
+  selected_plan "$plan" "$selected"
+  cp -- "$selected" "$LOG_DIR/plan.json"
+  printf '\nDiscovered environments (installation paths are retained):\n' >&2
+  jq -r '.plan[]|[.kind,.prefix,(.version+" -> "+(.target.version//.requested_version//"")),.action,.reason]|@tsv' "$selected" >&2
   printf '\nStorage inventory: %s/storage.json\n' "$LOG_DIR" >&2
-  count="$(jq '[.plan[]|select(.action=="update" or .action=="prepare_target")]|length' "$plan")"
-  if ((count == 0)); then
-    event no_updates '' 'Review plan.json and inventory.json for exclusions and skip reasons'
-    return 1
+  if ! jq -e 'any(.plan[];.action=="update" or .action=="prepare_target")' "$selected" >/dev/null; then
+    event no_updates '' 'See plan.json for exclusions and skip reasons'
+    return 0
   fi
-  require_original_bases "$plan"
+  printf 'Stop applications using the environments selected for update. Enter skips an environment.\n' >&2
+  for phase in installations venvs replacement; do
+    collect_choices "$selected" "$phase"
+    selected_plan "$plan" "$selected"
+  done
+  cp -- "$selected" "$plan"
+  cp -- "$plan" "$LOG_DIR/plan.json"
+  jq -r '.plan[]|select(.approval=="confirmed" and .action=="skip")|"\(.prefix): \(.reason)"' "$plan" >&2
   jq '[.plan[]|select(.action=="update" or .action=="prepare_target")|
-    {prefix,version,target_version:(.target.version//.requested_version),required_base}]' "$plan" >"$WORK/approved-intent.json"
-  printf '\nStop applications using these environments. Update %s environments at their original paths? [Enter=yes, n=cancel] ' "$count" >&2
-  if ! IFS= read -r answer; then
-    printf '\n' >&2
-    die 'Confirmation input ended; no targets prepared or environments updated'
+    {prefix,kind,approval,version,base_prefix,target_version:(.target.version//.requested_version),base_choice,required_base,conda}]' "$plan" >"$WORK/approved-intent.json"
+  if ! jq -e 'length>0' "$WORK/approved-intent.json" >/dev/null; then
+    event cancelled '' 'No targets prepared or environments updated'
+    return 0
   fi
-  case "$answer" in
-    '' | y | Y)
-      BATCH_APPROVED=1
-      event confirmation '' 'Approved original-path batch'
-      ;;
-    *)
-      event cancelled '' 'No targets prepared or environments updated'
-      return 1
-      ;;
-  esac
+  if jq -e 'any(.plan[];.action=="prepare_target")' "$plan" >/dev/null && ! storage_allowed "$RUNTIME_DIR"; then
+    die "A target build needs an eligible cache mount for $RUNTIME_DIR. Run again with XDG_DATA_HOME on a mount included for discovery."
+  fi
 }
 check_interactive_plan() {
   local plan=$1
-  require_original_bases "$plan"
-  jq -e --slurpfile intent "$WORK/approved-intent.json" '
-    .plan as $plan | all($intent[0][]; . as $expected |
-      any($plan[]; .prefix==$expected.prefix and .version==$expected.version and
-        .action=="update" and .target.version==$expected.target_version and
-        .required_base==$expected.required_base))' "$plan" >/dev/null || die 'Prepared targets changed the approved plan; no environments updated'
+  selected_plan "$plan" "$plan"
+  cp -- "$plan" "$LOG_DIR/plan.json"
+  if ! jq -e --arg cache "$RUNTIME_DIR" --slurpfile intent "$WORK/approved-intent.json" '
+    [.plan[]|select(.action=="update" or .action=="prepare_target")] as $updates |
+    ($updates|length)==($intent[0]|length) and all($intent[0][]; . as $expected |
+      any($updates[]; .action=="update" and .approval=="confirmed" and .prefix==$expected.prefix and .kind==$expected.kind and
+        .version==$expected.version and .base_prefix==$expected.base_prefix and .conda==$expected.conda and
+        .target.version==$expected.target_version and .base_choice==$expected.base_choice and
+        (if $expected.base_choice=="replacement" and $expected.required_base==null then
+          .target.source=="installed" and .required_base==.target.prefix and (.required_base|startswith($cache+"/"))
+         else .required_base==$expected.required_base end)))' "$plan" >/dev/null; then
+    jq -r --slurpfile intent "$WORK/approved-intent.json" '
+      ($intent[0]|INDEX(.prefix)) as $approved | .plan[] |
+      select($approved[.prefix]!=null and .action=="skip") | "\(.prefix): \(.reason)"' "$plan" >&2
+    die "Prepared targets changed the approved plan; no environments updated. See $LOG_DIR/plan.json"
+  fi
 }
-
 confirm_plan() {
-  local plan=$1 destination=$2 item prefix answer input_fd base
+  local plan=$1 destination=$2 item prefix kind input_fd base ENV_APPROVAL
   local -A blocked=()
   : >"$WORK/confirmed.ndjson"
   # Keep responses separate from the JSON stream used by the loop.
   exec {input_fd}<&0
   while IFS= read -r item; do
-    if [[ $(jq -r .kind <<<"$item") == venv ]]; then
-      prefix="$(jq -r .prefix <<<"$item")"
-      if [[ $(jq -r .action <<<"$item") == update ]]; then
-        if ((BATCH_APPROVED)); then
-          item="$(jq -c '.approval="confirmed"' <<<"$item")"
-        elif ((ASSUME_YES)); then
-          item="$(jq -c '.approval="bypassed"' <<<"$item")"
-          event confirmation "$prefix" 'bypassed (-Y)'
-        else
-          printf 'Update venv %s (%s -> %s)? [y/N] ' "$prefix" \
-            "$(jq -r .version <<<"$item")" "$(jq -r .target.version <<<"$item")" >&2
-          if ! IFS= read -r -u "$input_fd" answer; then
-            printf '\n' >&2
-            die 'Confirmation input ended; no environments updated. Use -Y for unattended apply.'
-          fi
-          printf '\n' >&2
-          case "$answer" in
-            y | Y)
-              item="$(jq -c '.approval="confirmed"' <<<"$item")"
-              event confirmation "$prefix" 'approved'
-              ;;
-            *)
-              item="$(jq -c '.action="skip"|.reason="Venv update declined"|.approval="declined"' <<<"$item")"
-              event confirmation "$prefix" 'declined'
-              ;;
-          esac
-        fi
+    kind="$(jq -r .kind <<<"$item")"
+    prefix="$(jq -r .prefix <<<"$item")"
+    if [[ $kind == venv || $kind == conda ]] && [[ $(jq -r .action <<<"$item") == update ]]; then
+      if ((ASSUME_YES)); then
+        item="$(jq -c '.approval="bypassed"' <<<"$item")"
+        event confirmation "$prefix" 'bypassed (-Y)'
+      else
+        ask_environment "$item" "$input_fd"
+        item="$(jq -c --arg choice "$ENV_APPROVAL" '.approval=$choice |
+          if $choice=="declined" then .action="skip" |
+            .reason=(if .kind=="venv" then "Venv update declined" else "Conda update declined" end) else . end' <<<"$item")"
       fi
-      if [[ $(jq -r .action <<<"$item") == skip ]]; then
-        base="$(jq -r .base_prefix <<<"$item")"
-        blocked[$base]=1
-      fi
+    fi
+    if [[ $kind == venv && $(jq -r .action <<<"$item") == skip ]]; then
+      base="$(jq -r .base_prefix <<<"$item")"
+      blocked[$base]=1
     fi
     printf '%s\n' "$item" >>"$WORK/confirmed.ndjson"
   done < <(jq -c '.plan[]' "$plan")
@@ -804,7 +1051,7 @@ confirm_plan() {
   : >"$WORK/approved.ndjson"
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
-    if [[ $(jq -r .kind <<<"$item") == raw && $(jq -r .action <<<"$item") == update && ${blocked[$prefix]+yes} ]]; then
+    if [[ $(jq -r .kind <<<"$item") != venv && $(jq -r .action <<<"$item") == update && ${blocked[$prefix]+yes} ]]; then
       item="$(jq -c '.action="skip"|.reason="Dependent venv is skipped; raw base left unchanged"' <<<"$item")"
     fi
     printf '%s\n' "$item" >>"$WORK/approved.ndjson"
@@ -1042,6 +1289,7 @@ replace_literal() {
 }
 patch_stage() {
   local entry=$1 stage prefix kind target target_prefix version mm path name base candidate info
+  local venv_mode=--copies
   local -a names=() options=()
   stage="$(jq -r .stage "$entry")"
   prefix="$(jq -r .prefix "$entry")"
@@ -1062,13 +1310,20 @@ patch_stage() {
     done < <(find "$stage/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
     base="$(jq -r .base_prefix "$entry")"
     candidate=$base/bin/python$mm
-    if [[ $(jq -r '.base_in_scope//false' "$entry") == true ]] && info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
+    if jq -e '.base_in_scope==true and .base_choice!="replacement"' "$entry" >/dev/null &&
+      info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
     if awk -F= '$1~/^include-system-site-packages *$/ && $2~/true/ {found=1} END{exit !found}' "$stage/pyvenv.cfg"; then options+=(--system-site-packages); fi
     # venv rewrites pyvenv.cfg on upgrade. Preserve CPython's verbatim prompt
     # record (including quotes and escapes) without sourcing or decoding it.
     awk '/^prompt[[:space:]]*=/{print; exit}' "$stage/pyvenv.cfg" >"$WORK/venv-prompt"
-    runpy "$target" -I -m venv --upgrade --without-pip --copies "${options[@]}" "$stage"
-    for name in "${names[@]}"; do [[ -f $stage/bin/$name ]] || cp -p --remove-destination -- "$stage/bin/python" "$stage/bin/$name"; done
+    # Conda binaries can locate libpython relative to their own bin/ directory.
+    if [[ -d ${target%/bin/*}/conda-meta ]]; then venv_mode=--symlinks; fi
+    runpy "$target" -I -m venv --upgrade --without-pip "$venv_mode" "${options[@]}" "$stage"
+    for name in "${names[@]}"; do
+      [[ ! -f $stage/bin/$name ]] || continue
+      if [[ $venv_mode == --symlinks ]]; then ln -sfn -- python "$stage/bin/$name"
+      else cp -p --remove-destination -- "$stage/bin/python" "$stage/bin/$name"; fi
+    done
     replace_literal "$stage/pyvenv.cfg" "$stage" "$prefix"
     cat "$WORK/venv-prompt" >>"$stage/pyvenv.cfg"
   else
@@ -1107,6 +1362,11 @@ publish_tree() {
 }
 restore_one() {
   local entry=$1 journal=$2 prefix backup identity
+  if [[ $(jq -r .kind "$entry") == conda ]]; then
+    load_conda_support || die 'Conda rollback requires python_updater_conda.sh'
+    conda_restore_one "$entry" "$journal"
+    return
+  fi
   jq -e '.publication_started == true' "$entry" >/dev/null || die 'No publication started; backup is not restorable'
   prefix="$(jq -r .prefix "$entry")"
   backup="$(jq -r .backup "$entry")"
@@ -1126,12 +1386,19 @@ worker_failure() {
   backup="$(jq -r .backup "$entry")"
   publication="$(jq -r '.publication_started//false' "$entry")"
   checkpoint "$entry" "$journal" --argjson exit "$status" '.error=("Update worker exited with status "+($exit|tostring))|.status="failed"'
-  if [[ $publication == true && -d $backup ]]; then bash "$SELF" _restore "$entry" "$journal" || checkpoint "$entry" "$journal" '.status="rollback_failed"'; fi
+  if [[ $publication == true && ( -d $backup || $(jq -r .kind "$entry") == conda ) ]]; then
+    bash "$SELF" _restore "$entry" "$journal" || checkpoint "$entry" "$journal" '.status="rollback_failed"'
+  fi
   event failed "$prefix" "Worker exit $status"
   exit "$status"
 }
 apply_one() {
   local entry=$1 journal=$2 checks=$3 prefix stage backup kind version available size needed identity manifest packages_file result
+  if [[ $(jq -r .kind "$entry") == conda ]]; then
+    load_conda_support || die 'Conda update requires python_updater_conda.sh'
+    conda_apply_one "$entry" "$journal" "$checks"
+    return
+  fi
   trap 'worker_failure "$?" "$entry" "$journal"' ERR
   trap 'worker_failure 130 "$entry" "$journal"' INT TERM
   prefix="$(jq -r .prefix "$entry")"
@@ -1196,6 +1463,28 @@ rollback_entries() {
   done < <(jq -c '.entries|reverse[]' "$journal")
   return "$failed"
 }
+# Builds can take time. Check the scanned installation under its lock before
+# making a journal for the approved source paths.
+approved_source_matches() {
+  local item=$1 prefix binary config_home='' path live
+  prefix="$(jq -r .prefix <<<"$item")"
+  binary="$(jq -r .binary <<<"$item")"
+  [[ -d $prefix && ! -L $prefix && ! -L $prefix/bin && ! -L $prefix/lib ]] || return 1
+  [[ $(stat -Lc '%d:%i' -- "$prefix") == "$(jq -r .prefix_identity <<<"$item")" &&
+    $(stat -Lc %u -- "$prefix") == "$EUID" ]] || return 1
+  scan_path_allowed "$(realpath -m -- "$binary")" || return 1
+  if [[ $(jq -r .kind <<<"$item") == venv ]]; then
+    [[ -f $prefix/pyvenv.cfg && ! -L $prefix/pyvenv.cfg ]] && storage_allowed "$prefix/pyvenv.cfg" || return 1
+    config_home="$(venv_home "$prefix/pyvenv.cfg")" || return 1
+  fi
+  for path in "$prefix/lib" "$prefix/lib64" "$config_home"; do
+    [[ -z $path ]] || storage_allowed "$(realpath -m -- "$path")" || return 1
+  done
+  live="$(probe "$binary")" || return 1
+  jq -e --argjson expected "$item" '
+    def identity: [.kind,.prefix,.base_prefix,.version,.soabi,.shared,.pointer_bits,.machine,.managed];
+    identity==($expected|identity)' <<<"$live" >/dev/null
+}
 apply_plan() {
   local plan=$1 journal=$2 item prefix snapshot path token stage backup count=0 failed=0 fatal=0 base
   local -A blocked=()
@@ -1203,17 +1492,22 @@ apply_plan() {
   jq '[.plan[]|select(.action=="update")]' "$plan" >"$WORK/lock-list.json"
   assert_control_paths "$WORK/lock-list.json" "$journal" "$journal.entries" "$journal.post-verify.json" "$LOG_DIR" "$WORK"
   acquire_locks "$WORK/lock-list.json"
-  confirm_plan "$plan" "$WORK/confirmed-plan.json"
-  plan="$WORK/confirmed-plan.json"
+  while IFS= read -r item; do
+    approved_source_matches "$item" || die "Environment changed since selection: $(jq -r .prefix <<<"$item"). Start a new run to review it; no environments updated."
+  done < <(jq -c '.plan[]|select(.kind!="conda" and .action=="update" and .approval=="confirmed")' "$plan")
+  if ((INTERACTIVE == 0)); then
+    confirm_plan "$plan" "$WORK/confirmed-plan.json"
+    plan="$WORK/confirmed-plan.json"
+  fi
   cp -- "$plan" "$LOG_DIR/approved-plan.json"
   mkdir -p -- "$journal.entries"
   jq -n --arg created "$(now)" --arg path "$journal" --arg log_file "$LOG_FILE" --slurpfile plan "$plan" \
     '{schema:2,engine:"bash",created:$created,path:$path,log_file:$log_file,complete:false,failures:0,entries:[],failed_snapshots:[],
       skipped:[$plan[0].plan[]|select(.action=="skip")|{prefix,version,reason}],
-      end_of_support:[$plan[0].plan[]|select(.eol!="")|{prefix,version,eol}],discovery_warnings:$plan[0].inventory.warnings}' | atomic_write "$journal"
+      end_of_support:[$plan[0].plan[]|select((.eol//"")!="")|{prefix,version,eol}],discovery_warnings:$plan[0].inventory.warnings}' | atomic_write "$journal"
   : >"$WORK/prepared-plan.ndjson"
   while IFS= read -r item; do
-    [[ $(jq -r .action <<<"$item") == update ]] || {
+    [[ $(jq -r .action <<<"$item") == update && $(jq -r .kind <<<"$item") != conda ]] || {
       printf '%s\n' "$item" >>"$WORK/prepared-plan.ndjson"
       continue
     }
@@ -1237,7 +1531,7 @@ apply_plan() {
   fi
   while IFS= read -r item; do
     prefix="$(jq -r .prefix <<<"$item")"
-    if [[ $(jq -r .kind <<<"$item") == raw && ${blocked[$prefix]+yes} ]]; then
+    if [[ $(jq -r .kind <<<"$item") != venv && ${blocked[$prefix]+yes} ]]; then
       item="$(jq -c '.action="skip"|.reason="Dependent venv snapshot failed; raw base left unchanged"' <<<"$item")"
       json_edit "$journal" --arg prefix "$prefix" '.skipped += [{prefix:$prefix,reason:"Dependent venv snapshot failed; raw base left unchanged"}]'
     fi
@@ -1250,7 +1544,9 @@ apply_plan() {
     stage=$prefix$MARKER$token.stage
     backup=$prefix$MARKER$token.backup
     path="$journal.entries/$count.json"
-    jq --arg stage "$stage" --arg backup "$backup" --arg entry_file "$path" '.+{stage:$stage,backup:$backup,entry_file:$entry_file,status:"pending",old_version:.version}' <<<"$item" | atomic_write "$path"
+    jq --arg stage "$stage" --arg backup "$backup" --arg entry_file "$path" '
+      .+{entry_file:$entry_file,status:"pending",old_version:.version} |
+      if .kind=="conda" then . else .+{stage:$stage,backup:$backup} end' <<<"$item" | atomic_write "$path"
     json_edit "$journal" --slurpfile entry "$path" '.entries += [$entry[0]]'
     if ! bash "$SELF" _apply-one "$path" "$journal" "$CHECKS" </dev/null; then
       failed=$((failed + 1))
@@ -1271,6 +1567,7 @@ apply_plan() {
 }
 verify_journal() {
   local journal=$1 destination=$2 entry prefix packages_file manifest result failed=0
+  local -a check
   : >"$WORK/verification.ndjson"
   while IFS= read -r entry; do
     jq -c '.+{passed:false,snapshot_failed:true}' <<<"$entry" >>"$WORK/verification.ndjson"
@@ -1283,12 +1580,18 @@ verify_journal() {
       failed=$((failed + 1))
       continue
     fi
-    packages_file="$(mktemp "$WORK/expected.XXXXXX")"
-    manifest="$(mktemp "$WORK/manifest.XXXXXX")"
     result="$(mktemp "$WORK/result.XXXXXX")"
-    jq .package_snapshot <<<"$entry" >"$packages_file"
-    jq .runtime_hashes <<<"$entry" >"$manifest"
-    if validate "$prefix" "$(jq -r .target.version <<<"$entry")" "$packages_file" "$manifest" "$prefix" final "$CHECKS" "$result" "$(jq -r '.required_base//empty' <<<"$entry")" 2>"$WORK/verify-error"; then
+    if [[ $(jq -r .kind <<<"$entry") == conda ]]; then
+      load_conda_support || die 'Conda verification requires python_updater_conda.sh'
+      check=(conda_verify_entry "$entry" "$CHECKS" "$result")
+    else
+      packages_file="$(mktemp "$WORK/expected.XXXXXX")"
+      manifest="$(mktemp "$WORK/manifest.XXXXXX")"
+      jq .package_snapshot <<<"$entry" >"$packages_file"
+      jq .runtime_hashes <<<"$entry" >"$manifest"
+      check=(validate "$prefix" "$(jq -r .target.version <<<"$entry")" "$packages_file" "$manifest" "$prefix" final "$CHECKS" "$result" "$(jq -r '.required_base//empty' <<<"$entry")")
+    fi
+    if "${check[@]}" 2>"$WORK/verify-error"; then
       jq -cn --arg prefix "$prefix" --slurpfile validation "$result" '{prefix:$prefix,passed:true,validation:$validation[0]}' >>"$WORK/verification.ndjson"
     else
       failed=$((failed + 1))
@@ -1418,6 +1721,7 @@ main() {
       load_storage
       if ((INTERACTIVE)); then
         automatic_roots
+        ((${#ROOTS[@]})) || return 0
       else
         ((${#ROOTS[@]})) || ROOTS=("$(canonical "$HOME")")
       fi
@@ -1442,8 +1746,8 @@ main() {
       discover_targets "$WORK/inventory.json"
       make_plan "$WORK/inventory.json" "$WORK/plan.json"
       if ((INTERACTIVE)); then
-        cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
-        if ! confirm_interactive "$WORK/plan.json"; then return; fi
+        confirm_interactive "$WORK/plan.json"
+        [[ -s $WORK/approved-intent.json ]] && jq -e 'length>0' "$WORK/approved-intent.json" >/dev/null || return 0
       fi
       if [[ $COMMAND == apply ]]; then
         cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"

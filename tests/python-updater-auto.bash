@@ -17,6 +17,18 @@ minor=${minor%.*}
 lab=$(mktemp -d)
 trap 'rm -rf -- "$lab"' EXIT
 mkdir -p "$lab/scripts" "$lab/elsewhere" "$lab/projects"
+mkdir "$lab/tools"
+export AUTO_TEST_DF=$(command -v df)
+cat >"$lab/tools/df" <<'DF'
+#!/usr/bin/env bash
+if [[ $1 == -B1 && $2 == --output=avail,itotal,iavail && -n ${AUTO_TEST_SPACE:-} ]]; then
+  printf 'Avail Inodes IFree\n%s\n' "$AUTO_TEST_SPACE"
+  exit 0
+fi
+exec "$AUTO_TEST_DF" "$@"
+DF
+chmod +x "$lab/tools/df"
+export PATH="$lab/tools:$PATH"
 cp -- "$updater" "$lab/scripts/update_python_envs.sh"
 export AUTO_TEST_INSTALLER="${updater%/*}/install_python.sh" AUTO_TEST_TARGET="$target"
 export AUTO_TEST_CALLS="$lab/installer-calls" AUTO_TEST_ARGS="$lab/installer-args" AUTO_TEST_FAIL=0
@@ -32,15 +44,17 @@ printf 'build\n' >>"$AUTO_TEST_CALLS"
 printf '%s\n' "$@" >"$AUTO_TEST_ARGS"
 # Preparation must not consume a venv confirmation.
 if IFS= read -r answer; then echo 'Installer received confirmation input' >&2; exit 25; fi
-((AUTO_TEST_FAIL == 0)) || { echo 'fixture build failed' >&2; exit 19; }
 destination=$1
+[[ $TMPDIR == "$destination/src" && -d $TMPDIR ]]
+printf 'temporary compilation object\n' >"$TMPDIR/fixture.o"
+((AUTO_TEST_FAIL == 0)) || { echo 'fixture build failed' >&2; exit 19; }
 shift
 selected=''
 while (($#)); do
   case "$1" in
     --py) selected=$2; shift 2 ;;
     --jobs) [[ $2 =~ ^[1-9][0-9]*$ ]]; shift 2 ;;
-    --reuse | --skip-conda | --no-bashrc | --skip-apt | --no-sudo) shift ;;
+    --reuse | --skip-conda | --no-bashrc | --skip-apt | --no-sudo | --enable-shared) shift ;;
     *) echo "Unexpected installer option: $1" >&2; exit 26 ;;
   esac
 done
@@ -71,9 +85,28 @@ bad run apply -Y "$lab/projects/a" --output "$lab/projects/a/update.json" >"$lab
 grep -F 'Control path must be outside updated prefixes' "$lab/control-error" >/dev/null
 [[ ! -e $AUTO_TEST_CALLS && ! -e $lab/projects/a/update.json ]]
 
+# Each cold build checks its own filesystem before launching the compiler.
+for space in '67108864 80000 79999' '4294967296 80000 12'; do
+  PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=0 AUTO_TEST_SPACE="$space" bad run apply -Y "$lab/projects/a" >"$lab/space-error" 2>&1
+  grep -F 'Insufficient build space for Python' "$lab/space-error" >/dev/null
+  grep -F "$cache" "$lab/space-error" >/dev/null
+  [[ ! -e $AUTO_TEST_CALLS && ! -e $(output_path "$lab/space-error") ]]
+  check_version "$lab/projects/a" "$old_version"
+done
+# A measured smaller build can be attempted explicitly while there is capacity.
+PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1 AUTO_TEST_SPACE='536870912 80000 79999' \
+  AUTO_TEST_CALLS="$lab/override-calls" AUTO_TEST_FAIL=1 bad run apply -Y "$lab/projects/a" >"$lab/override-space" 2>&1
+grep -F 'Proceeding below the estimate' "$lab/override-space" >/dev/null
+[[ $(wc -l <"$lab/override-calls") == 1 && ! -e $(output_path "$lab/override-space") ]]
+for space in '0 0 0' '4294967296 80000 0'; do
+  PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1 AUTO_TEST_SPACE="$space" bad run apply -Y "$lab/projects/a" >"$lab/space-error" 2>&1
+  grep -F 'Insufficient build space' "$lab/space-error" >/dev/null
+  [[ ! -e $AUTO_TEST_CALLS ]]
+done
+
 # No --target, --output or --runtime-dir: the defaults prepare one needed branch,
 # retain both prompt responses, and save the journal beside the process log.
-printf 'y\nN\n' | run apply "$lab/projects" --no-sudo --jobs 2 >"$lab/cold-output" 2>&1
+printf 'y\nN\n' | AUTO_TEST_SPACE='1073741824 0 0' run apply "$lab/projects" --no-sudo --jobs 2 >"$lab/cold-output" 2>&1
 journal=$(output_path "$lab/cold-output")
 [[ $journal == "$lab/scripts/log/"*/journal.json ]]
 jq -e '(.entries|length)==1 and .entries[0].approval=="confirmed" and
@@ -88,9 +121,10 @@ grep -F 'fixture: prepared real patched CPython' "${journal%/*}/process.log" >/d
 grep -F 'target_build_finished' "${journal%/*}/process.log" >/dev/null
 cached=$(jq -r --arg mm "$minor" '.[$mm]' "$cache/targets.json")
 [[ $cached == "$cache/build-"*/opt/python-*/bin/python"$minor" ]]
+[[ ! -e ${cached%/opt/*}/src ]]
 
 # A second update reuses the cache, even when a build would fail.
-AUTO_TEST_FAIL=1 run -Y apply "$lab/projects/b" >"$lab/reuse-output" 2>&1
+AUTO_TEST_SPACE='0 1 0' AUTO_TEST_FAIL=1 run -Y apply "$lab/projects/b" >"$lab/reuse-output" 2>&1
 reuse_journal=$(output_path "$lab/reuse-output")
 jq -e '(.entries|length)==1 and .entries[0].target.source=="cache"' "$reuse_journal" >/dev/null
 check_version "$lab/projects/b" "$version"
@@ -130,6 +164,7 @@ AUTO_TEST_FAIL=1 bad run apply -Y "$lab/build-failure" --runtime-dir "$lab/faile
 check_version "$lab/build-failure" "$old_version"
 cmp "$lab/before.cfg" "$lab/build-failure/pyvenv.cfg"
 grep -F 'Target preparation failed; existing environments were not updated' "$lab/failed-output" >/dev/null
+[[ ! -e $lab/failed-cache/targets.json && -z $(find "$lab/failed-cache" -name 'build-*' -print -quit) ]]
 
 # Never repair an unhealthy cached runtime in place underneath its dependents.
 cached_prefix=${cached%/bin/*}

@@ -158,3 +158,4 @@ echo 'PASS: discovery scope, interrupted backup, dependency baseline, prompt, mo
 bash "${updater%/*}/tests/python-updater-controls.bash" "$old" "$target"
 bash "${updater%/*}/tests/python-updater-auto.bash" "$old" "$target"
 bash "${updater%/*}/tests/python-updater-interactive.bash" "$old" "$target"
+bash "${updater%/*}/tests/python-updater-base-choice.bash" "$old" "$target"

@@ -29,9 +29,9 @@ When modifying scripts, update the corresponding `.md` file to reflect changes.
    - Use `nvidia-settings` and `nvidia-smi` for GPU operations
 
 3. **Python Environment Management**
-   - `install_python.sh`: Installs multiple Python versions (3.8, 3.10, 3.11, 3.13) and Miniforge
+   - `install_python.sh`: Installs multiple Python versions (3.8, 3.10, 3.11, 3.12, 3.13) and Miniforge
    - Creates a custom BASE_DIR structure with `bin/`, `opt/`, `CACHE/`, `shims/`
-   - Provides wrapper scripts (`py38`, `py10`, `py11`, `py13`, `python3-11`, `pip3-13`, etc.)
+   - Provides wrapper scripts (`py38`, `py10`, `py11`, `py12`, `py13`, `python3-11`, `pip3-13`, etc.)
    - Conda wrappers: `cbase`, `cenv <envname>`
    - Supports selective version installation with `--py "3.13 3.11"` flag
    - See `SKILL.md` for usage patterns with existing installations
@@ -70,20 +70,20 @@ Post-clone VM identity reset:
 ### install_python.sh
 Multi-version Python installer:
 - Run as normal user (not root/sudo)
-- Syntax: `bash install_python.sh <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--skip-conda] [--jobs N]`
-- Python versions: 3.8.20, 3.10.22, 3.11.18, 3.13.18 (compiled from source)
+- Syntax: `bash install_python.sh <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--enable-shared] [--skip-conda] [--jobs N]`
+- Python versions: 3.8.20, 3.10.22, 3.11.18, 3.12.16, 3.13.18 (compiled from source)
 - Validates Python downloads with OpenPGP signatures (unless `--skip-gpg`)
 - Installs dependencies via apt (unless `--skip-apt`)
 - Defaults to 3.11 and 3.13; use `--py` for explicit branch selection. Python 3.8 and 3.10 are end-of-life.
 - `update_python_envs.sh` scans, plans, applies, verifies, and rolls back private CPython patch updates.
-- `bash update_python_envs.sh` discovers existing account-owned installations on eligible mounted filesystems, shows the original-path plan, and accepts Enter before builds or updates. It requires original venv bases and preinstalled dependencies, without modifying the installer or shell setup.
-- Discovery excludes HDD-backed and unknown storage, including linked targets and nested mounts. `storage.json` records classifications; mixed HDD/SSD device stacks are excluded.
+- `bash update_python_envs.sh` discovers account-owned installations, keeps eligible original venv bases, and offers an explicit per-venv replacement when the original base cannot be used. Enter skips a base change. Raw installations, venvs and Conda environments have individual y/yes confirmations before builds. Conda uses its solver and revision history. Dependencies must be preinstalled.
+- Automatic discovery excludes HDDs, loop devices and unsupported storage. Zero-argument runs ask about uncertain local mounts. When none qualify or are offered and HOME is on a reported HDD, the operator can choose to scan HOME on its own mount. Enter skips a scan choice. Enter skips an environment update. Explicit commands exclude HDDs and uncertain media. `storage.json` records the reported class, choice and scope.
 - `bash update_python_envs.sh apply` defaults to scanning `$HOME`, using the installer pins, reusing healthy cached/discovered targets, and building needed targets. `--target` and `--output` are optional overrides; `plan` reports required builds without installing.
 - Prepared runtimes live under `${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater` (`--runtime-dir` overrides it). Keep the unique build directories while venvs use them. Default JSON outputs, including the recovery journal, are saved in the run's log directory.
-- Apply confirms each venv with `y`/`Y`; `-Y` bypasses prompts. Process logs default to `log/<UTC timestamp>.<suffix>/process.log` beside the updater; `--log-dir` changes the root.
+- Explicit apply prompts for each venv and Conda environment. `-Y` bypasses these prompts. Process logs default to `log/<UTC timestamp>.<suffix>/process.log` beside the updater; `--log-dir` changes the root.
 - Keep recovery files outside updated prefixes. Linked `pyvenv.cfg` files are skipped to protect shared configuration.
 - Both environment scripts use native Bash/Unix utilities; do not embed Python source or a Python control engine in the `.sh` files.
-- Creates version-specific entry points in `<BASE_DIR>/bin/` (py38, py10, py11, py13)
+- Creates version-specific entry points in `<BASE_DIR>/bin/` (py38, py10, py11, py12, py13)
 - Optionally modifies `~/.bashrc` to add BASE_DIR to PATH (unless `--no-bashrc`)
 
 ## Development Guidelines

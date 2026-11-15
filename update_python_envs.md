@@ -1,7 +1,8 @@
 # update_python_envs.sh
 
 Patch private CPython installations and virtual environments on Linux with one
-native Bash script. Discovery, planning, metadata parsing, copying, validation,
+Bash entry point. Existing Conda environments use their own solver through the adjacent
+`python_updater_conda.sh` helper. Discovery, planning, metadata parsing, copying, validation,
 and rollback use Bash and Unix utilities. There is no embedded/generated Python
 source, Python `-c` command, companion Python file, or Python control interpreter.
 The installed Python binaries are invoked through `--version` and existing
@@ -15,24 +16,46 @@ Stop applications using the selected environments, then run as their owner:
 bash update_python_envs.sh
 ```
 
-With no arguments, the updater discovers account-owned private installations and
-venvs on mounted SSD and memory filesystems, including installations outside
-`$HOME`. Existing `opt/python-*/bin/python*` installations and venv configurations
+With no arguments, the updater scans SSD and memory mounts for account-owned
+installations and venvs, including locations outside `$HOME`. For a supported
+local filesystem with uncertain backing media, it displays the mount path,
+device ID and reason and asks `Scan ... for Python environments? [y/N]`.
+`y` or `yes` includes that mount in this run. Enter or `n` skips it. Discovery
+can execute candidate interpreters, so choose trusted mounts. EOF at any mount
+question cancels the run before discovery starts.
+
+If there are no automatic roots or uncertain mounts to offer and the device
+covering `$HOME` reports HDD, the updater offers the home directory itself.
+For example, `Scan /home/vmadmin for Python environments? [y/N]` authorizes
+only that directory on its current mount. Enter or `n` finishes without a scan.
+Links outside the home directory and nested mounts are excluded.
+
+Existing `opt/python-*/bin/python*` installations and venv configurations
 provide the evidence; neither an installation registry nor changes to
 `install_python.sh` are required. An installation created with `--no-bashrc` or
 absent from PATH can be discovered by its files.
 
-The updater displays original paths, versions, planned actions and skip reasons.
-Press **Enter** (or `y`/`Y`) to approve the batch. Other answers cancel. EOF and
-Ctrl+C abort. Confirmation precedes target builds and environment changes; builds
-and checks receive EOF on stdin. Target preparation, backups, validation and
-rollback use the existing workflow and default paths.
+After discovery the updater shows the plan and asks about each eligible raw
+installation, Conda environment and venv. Answer **y** or **yes** to approve
+that path. Enter, **n** or **no** skips it. Answers are case-insensitive.
+Invalid input repeats that question. All choices precede builds and environment
+changes. End-of-input aborts, including after an earlier yes.
 
-This mode requires each selected venv's original private base to be discovered
-and eligible at the same target version. A blocked or missing base aborts before
-changes. Raw installations update at their existing prefixes, and venvs keep
-their original base paths. Both staged/final checks and later journal verification
-enforce that relationship. A source directory named `python-3.11.13` keeps that
+The venv prompt shows its original Python base. If the base is unavailable or
+declined, the prompt also identifies a compatible private replacement. Approving
+that choice retains the venv directory and changes its base. A skipped venv
+protects its original base. If a later sibling's decision prevents an approved
+in-place base update, the updater asks the affected venv about the replacement
+before preparing it. Only the selected environments enter the update journal.
+
+Before writing the journal, the updater locks the selected environments and
+compares each approved CPython installation with its scanned directory identity,
+original base, version and ABI. Staged, final and journal verification
+check the selected base. Each updated
+venv entry records the original `base_prefix`, the selected `required_base` and
+`base_choice: replacement` for an explicit change. Keep the replacement runtime
+while the venv uses it. Rollback restores the backed-up venv and its old base
+configuration. A source directory named `python-3.11.13` keeps that
 name even when its interpreter becomes 3.11.18. Any package-snapshot failure
 aborts the interactive batch before publication.
 
@@ -43,7 +66,7 @@ diagnostics. Automatic preparation uses the adjacent installer and therefore
 requires Ubuntu; other distributions need suitable preinstalled targets.
 
 Explicit commands retain scoped discovery, the `$HOME` default when roots are
-omitted, and per-venv `y`/`Y` confirmations. These commands can use separate target
+omitted, and individual venv and Conda confirmations. These commands can use separate target
 bases and remain suitable for advanced rebuild workflows:
 
 ```bash
@@ -51,7 +74,7 @@ bash update_python_envs.sh plan "$HOME"
 bash update_python_envs.sh apply "$HOME"
 ```
 
-To bypass venv confirmations in the explicit apply workflow:
+To approve all venv and Conda updates in the explicit apply workflow:
 
 ```bash
 bash update_python_envs.sh -Y apply
@@ -73,7 +96,7 @@ container with the sole UID mapping `0 0 1` is the test exception.
 On Ubuntu, `apply` installs missing `jq`/`rsync` through apt and invokes the
 adjacent installer for missing target runtimes. Building requires network access,
 disk space and the installer's compilation dependencies. Sudo may request a
-password. `-Y` bypasses venv confirmations; sudo authentication follows the host
+password. `-Y` approves all venv and Conda updates. Sudo authentication follows the host
 configuration. `--skip-apt` uses preinstalled dependencies, and `--no-sudo` also
 implies `--skip-apt`. `--jobs N` controls compilation workers (default: 4).
 Other Linux distributions can use compatible preinstalled targets; the bundled
@@ -81,20 +104,48 @@ source installer expects Ubuntu.
 
 ### Storage-aware discovery
 
-Every scan/plan/apply inventories mounts with `findmnt` and backing devices with
-inverse `lsblk` trees. A rotational disk anywhere in a partition/LVM/RAID stack
-excludes that mount. SSD and tmpfs/ramfs mounts are eligible. Unknown media,
-loop devices, network filesystems, overlay filesystems and unsupported filesystem
-types are excluded rather than treated as SSD. This can exclude virtual/container
-storage whose physical disks are hidden. Classification reflects the information
-reported by the operating system, including virtual disks' reported ROTA values.
-`storage.json` beside the process log records every mount and its classification.
+Every scan/plan/apply inventories mounts with `findmnt` and inverse `lsblk`
+trees. SSDs and memory filesystems are eligible for automatic discovery.
+Reported HDDs, including members of mixed stacks, are excluded from automatic
+scans. Loops, network mounts, overlay and unsupported filesystem types are
+excluded from all scan choices. Explicit commands skip HDDs and uncertain
+storage, including when `apply` uses `-Y`.
+
+Only the zero-argument workflow offers a scan choice for supported local
+filesystems with incomplete backing information, or an emulated disk reporting
+rotation. Virtual disk names and model/vendor information identify emulation.
+When available, `systemd-detect-virt --vm` also identifies guests whose disk
+identity is hidden. A reported physical HDD in the chain takes precedence.
+Choices apply to the exact mount path: nested mounts and bind aliases are
+assessed separately, even on the same device. Declining every offered mount
+when no automatic root exists finishes the run before discovery.
+`storage.json` beside the process log preserves the reported class and reason
+and records each answer in `scan_choice` with its path in `scan_scope`.
+The HDD home-directory prompt is offered only when no mounts qualified and no
+mount choices were offered. Its scope is the canonical home path and the mount
+that contains it. A new run collects new choices.
+If a new target must be built, its runtime cache also needs an eligible mount.
+Set `XDG_DATA_HOME` to a directory on an included mount for that run.
+
+If zero-argument discovery exits with no eligible directory mounts, read
+`storage.json` from the run directory printed beside `Log:`. The diagnostic prints
+the absolute inventory path and the mount, device ID and classification covering
+`$HOME`. The `Output:` journal path is prospective at this stage. This exit
+precedes the environment scan, target builds and journal creation.
+
+On a VM, `hdd` records rotation as reported by the guest. The interactive scan
+question handles emulated disks whose host media the guest cannot identify.
+`unknown` includes unsupported filesystems or incomplete device information; each inventory entry
+records its reason, and `process.log` includes any error from `lsblk`. Use
+`findmnt -T "$HOME" -o TARGET,SOURCE,FSTYPE,MAJ:MIN` and
+`lsblk --inverse --tree -o NAME,MAJ:MIN,ROTA,TYPE,VENDOR,MODEL,TRAN` to view the guest mapping.
+System tmpfs under `/run` or
+`/dev` and individual file mounts do not provide automatic discovery roots.
 
 Each physical walk uses `-xdev` and prunes nested mountpoints, including bind
-mounts. Eligible nested SSD mounts receive their own walk. HDD mounts and
-directory/interpreter links resolving to HDD receive no recursive search or
-interpreter probe. Venv config and library/base paths are checked before probing
-copied interpreters. These exclusions apply to explicit search roots as well.
+mounts. Eligible nested mounts receive their own walk. Excluded and declined
+mounts are pruned. Directory links, interpreter links, venv config and library/base
+paths use the same mount decisions before interpreter probes.
 The inventory records storage skip reasons; inaccessible directories are recorded
 as discovery warnings. The report covers reachable, permitted storage, not
 unmounted or inaccessible environments.
@@ -118,32 +169,58 @@ prefix. It checks the resolved binary's scope before invoking it through its
 `bin/python*` path and checks that its reported prefix matches the directory
 being inspected. `python -I -m sysconfig` supplies the identity and ABI.
 
-Updates preserve the Python minor branch, installed package versions, console
-scripts, and activation paths. The tool rejects downgrades and ABI mismatches;
-it skips distribution/runtime-managed prefixes, Conda prefixes/package caches,
-shared raw builds, and prefixes with linked `bin`, `lib`, or `pyvenv.cfg`.
+Private CPython updates preserve the minor branch, installed package versions,
+console scripts and activation paths. The updater skips distribution-managed
+installations, extracted Conda package caches, shared raw CPython builds, ABI
+mismatches, downgrades and prefixes with linked `bin`, `lib`, or `pyvenv.cfg`.
 Linked `pyvenv.cfg` files require a separate rebuild: staging must not write
 through a configuration link to the live environment or a shared file.
 System directories and the runtime tree named by `CODEX_PRIMARY_RUNTIME_ROOT`
-are protected. Use `--exclude` for other managed installations. Conda needs its
-own solver. Legacy or unusable environments need a rebuild.
+are protected. Use `--exclude` for other managed installations. Genuine Conda environments use the solver workflow below. Unusable environments need a rebuild.
 
 Package records are read from `*.dist-info/METADATA` and `*.egg-info/PKG-INFO`
 in the prefix's standard site-packages/dist-packages directories. Inherited base
 packages are included for `include-system-site-packages`. Empty metadata trees
 are recorded; populated metadata with no name/version fails the snapshot. Custom
 package paths supplied through `.pth` code, plugins, or environment variables need
-application-specific validation. This tool does not upgrade third-party packages.
+application-specific validation. Private CPython updates retain third-party package
+versions. Conda updates include the dependency changes shown in their solver preview.
 
 Paths containing spaces are supported. Tabs and line breaks are rejected.
 Names containing `.pyenv-update-` are reserved and excluded from discovery.
+
+## Conda environments
+
+A base installation and each named prefix receive individual choices. Include
+the Conda installation that owns the solver in the scan alongside any external
+prefixes. Extracted packages under a Conda package cache are skipped.
+The solver previews `python==<patch>` in the environment's existing minor
+series using its configured channels and constraints. The prompt lists Python
+and the dependent package changes. An unavailable patch or an unsatisfiable
+environment is reported as a skip with its reason.
+
+Before installation the updater checks the reviewed transaction and package
+state again. Conda installs the reviewed artifacts at the existing prefix.
+Verification checks the package records and runs the environment's Python.
+When a selected venv uses a selected Conda base of the same target version
+and ABI, the interactive updater reuses that interpreter. A symlink in the venv
+keeps Conda's shared libraries resolvable at their installation path.
+Rollback uses the recorded Conda revision. Keep the journal and its `.entries` directory.
+Recovery needs access to the original channels or an offline cache with the original
+channel indexes and package artifacts. Conda revision history covers Conda-managed
+packages. Files installed only by pip are outside that history.
+A subsequent independent Conda transaction
+requires separate review before rollback. Conda may populate its package or
+metadata cache while solving.
 
 ## Default targets, scan, and plan
 
 Plan and apply read the minimum target versions from the adjacent installer.
 Run `bash install_python.sh --print-pins` to print them. These are repository
-pins, not a query for the latest upstream release. Scan, verify, and rollback
-can run with the updater alone. Newer stable patch releases in the
+pins. The tested branches are 3.8, 3.10, 3.11, 3.12 and 3.13. Python 3.12
+uses 3.12.16 as its patch floor. Scan and CPython-only verification or rollback
+can run with the updater alone. Conda journals use the adjacent Conda helper.
+Newer stable CPython patch releases in the
 listed branches may be supplied. Python
 3.8 and 3.10 have reached end of support. Their final releases do not provide
 ongoing security maintenance; migration requires a supported minor branch.
@@ -155,7 +232,7 @@ discovered candidates, the newest patch is preferred. ABI and ownership checks
 also apply before an environment can update.
 
 If a required target is missing, `apply` calls `install_python.sh` with
-`--reuse --skip-conda --no-bashrc --py "<needed branches>"`. Only branches with
+`--reuse --skip-conda --no-bashrc --py <minor>` for each needed build. Only branches with
 eligible environments needing an update are built, including pinned legacy
 branches when present. An already current environment needs no build. Unknown
 branches are reported as skips. Existing package versions and minor branches
@@ -164,13 +241,40 @@ are preserved.
 The managed runtime directory defaults to
 `${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater`; `--runtime-dir DIR`
 overrides it. Each build gets a permanent `build-<timestamp>.<suffix>` directory
-and the cache's `targets.json` records its interpreter paths. Failed or unhealthy
+and the cache's `targets.json` records its interpreter paths. Shared and static
+builds of a minor series are selected separately. For example, a 3.12 venv based
+on Ubuntu's shared configuration can use a compatible private shared build. Failed or unhealthy
 builds are replaced by a new build directory, never repaired in place underneath
 dependent venvs. Keep these directories while venvs reference them. Target
 preparation in explicit `apply` commands happens before venv confirmations and receives EOF on stdin;
 declining an update can leave a prepared target for future use. A build failure
 aborts before modifying existing environments. A cache lock prevents concurrent
 builds in the same runtime directory.
+
+### Free space for source builds
+
+Before compiling a target, the updater prints the runtime directory and its
+available bytes and inodes. The build budget is 1 GiB and 16,000 free inodes
+per active build. The inode check applies to filesystems with a reported inode
+limit. The budget is an estimate. Compiler options, quotas and concurrent writes
+can change the space available during the build. For a build with a known smaller
+footprint, `PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1` accepts a positive amount below
+the estimate. A filesystem reporting zero available bytes or zero usable inodes
+under a fixed inode limit stops the build.
+
+Targets build one at a time. Each build uses its own `src` for sources, objects
+and compiler temporary files. A successful build releases that directory and
+records the validated interpreter in `targets.json` before starting the next
+target. If a later build fails, a retry can reuse earlier targets. On a handled
+failure the updater removes the unfinished build it created. If permissions prevent
+cleanup, the process log names the remaining directory. Live environment updates
+start after target preparation succeeds.
+
+For a prior run that stopped during compilation, the exact ended run's
+`build-…/src` contains disposable build files. Keep the sibling `opt` directory,
+the runtime cache index and recovery backups. To use a roomier approved mount
+for new builds in the zero-argument workflow, set `XDG_DATA_HOME` to a directory
+on that mount. Live environments use their own filesystems for staging and backup.
 
 Scan and preview with the same defaults:
 
@@ -193,7 +297,7 @@ aliases such as `python999 -> /missing/python` remain unresolved findings.
 ## Apply, verify, and rollback
 
 Stop applications and file synchronization jobs that write to the selected
-environments. Publication and rollback
+environments. CPython publication and rollback
 span multiple file operations; neither provides a live-process upgrade or crash
 atomicity. Retain disk space for a full stage and backup. The prefix directory
 keeps its identity. Rsync replaces changed files and link types through temporary
@@ -211,24 +315,18 @@ bash update_python_envs.sh verify update-journal.json \
 bash update_python_envs.sh rollback update-journal.json
 ```
 
-An explicit `apply` command requires a separate `y` or `Y` for every venv selected for updating. Each
-prompt shows its path and old/target versions. Enter, `n`, or any other response
-skips that venv. End-of-input aborts the apply before any environment is changed,
-including when earlier prompts received `y`. Responses come from the original
-standard input; workers and application checks continue to receive EOF.
+Explicit `apply` asks for each venv and each Conda environment. Every prompt
+shows its path and patch versions. A Conda prompt also shows its solver
+transaction. Responses come from the original standard input. Workers receive
+EOF. Explicit raw installations use the selected roots and exclusions.
+A declined dependent venv blocks its discovered base from changing. In this
+explicit workflow, approved venvs can use the separate compatible target.
 
-All venv confirmations are collected before updating raw bases. A skipped venv
-blocks an update to its discovered raw base, so declining it cannot change its
-runtime indirectly. Approved peers can use the separate patch target instead.
-Raw installations do not receive a separate prompt. Roots and exclusions define
-discovery scope; dependent environments outside that scope are not prompted.
+With no arguments, all eligible paths have individual approval, including raw
+installations, and every decision precedes target preparation. Environment
+checks and publication use only the approved paths.
 
-The no-argument mode instead collects one Enter confirmation for the displayed
-batch before target preparation. Its approval includes raw installations, and
-requires retaining each selected venv's original base. Explicit commands retain
-the per-venv and separate-target behavior described above.
-
-Use `-Y` for unattended updates. The option is accepted before or after `apply`:
+Use `-Y` on explicit apply for unattended updates. The option is accepted before or after `apply`:
 
 ```bash
 bash update_python_envs.sh -Y apply "$HOME"
@@ -257,7 +355,7 @@ in their shebang. Checks must have no unwanted side effects.
 }
 ```
 
-The script snapshots package metadata and the conflicts reported by `pip check`
+For CPython, the script snapshots package metadata and the conflicts reported by `pip check`
 before changing any raw base. Existing conflicts are recorded in the journal.
 New conflicts or a failure to run pip fail validation. Each staged and installed
 environment must pass version/prefix checks, core-module imports, package
@@ -272,7 +370,7 @@ peers may update using a separate target. Skips and EOL/unknown-alias findings
 remain visible even when the supported updates pass. No claim of complete
 vulnerability elimination is implied by a zero exit status.
 
-Keep the journal, adjacent `<journal>.entries/` directory and each
+Keep the journal, adjacent `<journal>.entries/` directory and each CPython
 `.pyenv-update-*.backup` for recovery. Rollback restores a prefix only after
 the worker has finished the backup and recorded `publication_started: true`.
 A `prepared` entry can have a partial backup. Rollback leaves that prefix
@@ -317,6 +415,34 @@ coreutils and Bash.
 
 ## Validation
 
+The base-choice regression driver takes a private CPython binary and an optional
+compatible replacement from the same minor series. It exercises a readable
+original excluded by the ownership check, mixed per-venv approvals,
+an existing cached target, target preparation, verification and rollback.
+
+```bash
+bash tests/python-updater-base-choice.bash /path/to/private/bin/python3.13
+```
+
+The Conda regression uses a real solver and a local channel built from two
+working CPython patch releases. It covers a solver-required dependency, base
+and named prefixes, independent decisions, verification and revision rollback.
+
+```bash
+bash tests/python-updater-conda.bash /path/to/conda/bin/conda \
+  /path/to/old/bin/python3.12 /path/to/patched/bin/python3.12
+```
+
+### November 15 interactive scan choices
+
+The interactive storage tests exercise default skips, explicit yes/no answers,
+VM rotation reports, incomplete device information, and EOF between mount
+choices. They record directory walks and interpreter probes to verify that
+declining a nested mount or a bind alias excludes it even when its parent or
+another mount on the same device is approved. Explicit commands keep their
+storage exclusions. With private interpreter fixtures the test also accepts a
+scan, then cancels or closes the separate update prompt before any build.
+
 ### November 12 interactive and storage revision
 
 The complete updater suite passed with private CPython 3.8.19 and 3.8.20 builds,
@@ -327,7 +453,7 @@ parent revision byte for byte.
 
 The test container hides its backing disks and its `/tmp` lacks ACL support.
 The full suite therefore used an ACL-capable workspace with a test-only mount
-classification fixture; the shipped unknown-storage exclusion was unchanged.
+classification fixture. That revision excluded unknown storage.
 Dedicated fixtures test HDD/SSD/LVM/RAID classifications and record the paths
 visited by real `find` commands. Target preparation uses the existing installer
 fixture with real CPython binaries; Ubuntu apt and installer source builds were

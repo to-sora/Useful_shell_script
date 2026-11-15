@@ -5,8 +5,9 @@
 PY38="3.8.20"
 PY310="3.10.22"
 PY311="3.11.18"
+PY312="3.12.16"
 PY313="3.13.18"
-PY_VERSIONS=("${PY313}" "${PY311}" "${PY310}" "${PY38}")
+PY_VERSIONS=("${PY313}" "${PY312}" "${PY311}" "${PY310}" "${PY38}")
 if [[ $# == 1 && $1 == --print-pins ]]; then
   printf '%s\n' "${PY_VERSIONS[@]}"
   exit 0
@@ -37,13 +38,14 @@ REUSE=0; SKIP_APT=0; SKIP_GPG=0; NO_BASHRC=0
 NO_SUDO=0       # <--- ADDED
 WANT_PYS="3.13 3.11"
 SKIP_CONDA=0
+ENABLE_SHARED=0
 BUILD_JOBS="$(nproc)"
 
 usage() {
   cat >&2 <<EOF
 Usage:
   bash $0 --print-pins
-  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--skip-conda] [--jobs N]
+  bash $0 <BASE_DIR> [--reuse] [--skip-apt] [--skip-gpg] [--no-bashrc] [--no-sudo] [--py "3.13 3.11"] [--enable-shared] [--skip-conda] [--jobs N]
 
 Notes:
 - BASE_DIR is any directory (can be on /). Script will create subdirs under it.
@@ -52,8 +54,10 @@ Notes:
 - --skip-gpg skips OpenPGP verification.
 - --no-bashrc will not append PATH block to ~/.bashrc.
 - --skip-conda builds CPython without installing or updating Miniforge.
+- --enable-shared builds CPython with libpython in its permanent installation directory.
 - --jobs N selects the number of compilation workers.
-- Default branches: 3.13 and 3.11. Explicit 3.8/3.10 selections are end-of-life.
+- Default branches: 3.13 and 3.11. Select 3.12 with --py "3.12".
+- Explicit 3.8/3.10 selections are end-of-life.
 EOF
   exit 2
 }
@@ -72,17 +76,22 @@ while [[ "${#}" -gt 0 ]]; do
     --no-bashrc) NO_BASHRC=1 ;;
     --no-sudo) NO_SUDO=1 ;;          # <--- ADDED
     --py) [[ $# -ge 2 && -n "$2" ]] || usage; shift; WANT_PYS="$1" ;;
+    --enable-shared) ENABLE_SHARED=1 ;;
     --skip-conda) SKIP_CONDA=1 ;;
     --jobs) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || usage; shift; BUILD_JOBS="$1" ;;
     *) usage ;;
   esac
   shift || true
 done
+if ((ENABLE_SHARED)); then
+  BASE_DIR="$(realpath -m -- "${BASE_DIR}")"
+  [[ ${BASE_DIR} != *:* ]] || die "A shared-library search path cannot contain a colon: ${BASE_DIR}"
+fi
 read -r -a selected_branches <<<"$WANT_PYS"
 [[ ${#selected_branches[@]} -gt 0 ]] || usage
 for selected in "${selected_branches[@]}"; do
   case "$selected" in
-    3.11|3.13) ;;
+    3.11|3.12|3.13) ;;
     3.8|3.10) log "WARNING: Python $selected is end-of-life; migration to a supported branch is required." ;;
     *) die "Unsupported Python branch: $selected" ;;
   esac
@@ -309,6 +318,13 @@ check_python_modules() {
   ((failed == 0))
 }
 
+check_shared_runtime() {
+  local pybin="$1" prefix="$2" majmin="$3" linkage
+  linkage="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd -- "$pybin")"
+  [[ $linkage == *" => $prefix/lib/libpython$majmin.so."* ]] ||
+    die "Shared Python must load libpython$majmin from $prefix/lib"
+}
+
 build_install_python() {
   local ver="$1"
   local majmin="$2"
@@ -316,12 +332,19 @@ build_install_python() {
   local pybin="${prefix}/bin/python${majmin}"
   local src_dir="${BASE_DIR}/src/Python-${ver}"
   local tar="${BASE_DIR}/src/Python-${ver}.tar.xz"
+  local -a configure_args=(--prefix="${prefix}" --with-ensurepip=upgrade)
+  if ((ENABLE_SHARED)); then
+    configure_args+=(--enable-shared)
+    # Copies of bin/python in venvs must resolve this exact permanent libpython.
+    local -x LD_RUN_PATH="${prefix}/lib"
+  fi
 
   if [[ -x "${pybin}" ]]; then
     local installed
     installed="$("${pybin}" -I --version)"
     installed="${installed#Python }"
     [[ "${installed}" == "${ver}" ]] || die "Prefix ${prefix} contains Python ${installed}; expected ${ver}"
+    if ((ENABLE_SHARED)); then check_shared_runtime "$pybin" "$prefix" "$majmin"; fi
     if check_python_modules "${pybin}"; then
       log "Python ${ver} installed and validated at ${pybin}; skipping build"
       return 0
@@ -335,11 +358,12 @@ build_install_python() {
   log "Building Python ${ver}"
   cd "${src_dir}"
   [[ -f Makefile ]] && make distclean >/dev/null 2>&1 || true
-  ./configure --prefix="${prefix}" --with-ensurepip=upgrade
+  ./configure "${configure_args[@]}"
   make -j "${BUILD_JOBS}"
   as_root make altinstall
 
   log "Sanity check Python ${ver}"
+  if ((ENABLE_SHARED)); then check_shared_runtime "$pybin" "$prefix" "$majmin"; fi
   "${pybin}" -V
   check_python_modules "${pybin}" || die "Python ${ver} failed its module checks"
 }
@@ -431,6 +455,7 @@ create_python_entrypoints() {
   local p38="${BASE_DIR}/opt/python-${PY38}/bin/python3.8"
   local p10="${BASE_DIR}/opt/python-${PY310}/bin/python3.10"
   local p11="${BASE_DIR}/opt/python-${PY311}/bin/python3.11"
+  local p12="${BASE_DIR}/opt/python-${PY312}/bin/python3.12"
   local p13="${BASE_DIR}/opt/python-${PY313}/bin/python3.13"
 
   # --- Helper function to safely register a version ---
@@ -464,6 +489,7 @@ EOF
   register_python "${p38}" "38"   "py38"
   register_python "${p10}" "3-10" "py10"
   register_python "${p11}" "3-11" "py11"
+  register_python "${p12}" "3-12" "py12"
   register_python "${p13}" "3-13" "py13"
 }
 
@@ -581,6 +607,7 @@ tests() {
   if should_proc "3.8"; then run_test_if_exists "${BASE_DIR}/bin/py38" "${PY38}"; fi
   if should_proc "3.10"; then run_test_if_exists "${BASE_DIR}/bin/py10" "${PY310}"; fi
   if should_proc "3.11"; then run_test_if_exists "${BASE_DIR}/bin/py11" "${PY311}"; fi
+  if should_proc "3.12"; then run_test_if_exists "${BASE_DIR}/bin/py12" "${PY312}"; fi
   if should_proc "3.13"; then run_test_if_exists "${BASE_DIR}/bin/py13" "${PY313}"; fi
 
   [[ "${SKIP_CONDA}" -eq 1 ]] && return 0
@@ -670,6 +697,7 @@ main() {
 
   # Filtered Build Steps
   if should_proc "3.13"; then build_install_python "${PY313}" "3.13"; fi
+  if should_proc "3.12"; then build_install_python "${PY312}" "3.12"; fi
   if should_proc "3.11"; then build_install_python "${PY311}" "3.11"; fi
   if should_proc "3.10"; then build_install_python "${PY310}" "3.10"; fi
   if should_proc "3.8";  then build_install_python "${PY38}"  "3.8";  fi
