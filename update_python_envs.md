@@ -40,11 +40,22 @@ Ctrl+C abort. Confirmation precedes target builds and environment changes; build
 and checks receive EOF on stdin. Target preparation, backups, validation and
 rollback use the existing workflow and default paths.
 
-This mode requires each selected venv's original private base to be discovered
-and eligible at the same target version. A blocked or missing base aborts before
-changes. Raw installations update at their existing prefixes, and venvs keep
-their original base paths. Both staged/final checks and later journal verification
-enforce that relationship. A source directory named `python-3.11.13` keeps that
+This mode keeps an eligible original venv base at its existing path. If that
+base cannot provide the target version, the updater shows the original path,
+the scan or plan reason, and a compatible private target or the cache directory
+where a target would be built. For that venv, Enter or `n` skips the update.
+`y` or `yes` allows it to use the replacement base at its existing venv path.
+The batch confirmation follows these choices. EOF cancels before any build or
+update. A skipped dependent protects its raw base from an in-place update.
+
+Before writing the journal, the updater locks the selected environments and
+checks that a venv approved for a base change still has the scanned directory
+identity, original base, version and ABI. Staged, final and journal verification
+check the selected base. Each updated
+venv entry records the original `base_prefix`, the selected `required_base` and
+`base_choice: replacement` for an explicit change. Keep the replacement runtime
+while the venv uses it. Rollback restores the backed-up venv and its old base
+configuration. A source directory named `python-3.11.13` keeps that
 name even when its interpreter becomes 3.11.18. Any package-snapshot failure
 aborts the interactive batch before publication.
 
@@ -263,10 +274,10 @@ runtime indirectly. Approved peers can use the separate patch target instead.
 Raw installations do not receive a separate prompt. Roots and exclusions define
 discovery scope; dependent environments outside that scope are not prompted.
 
-The no-argument mode instead collects one Enter confirmation for the displayed
-batch before target preparation. Its approval includes raw installations, and
-requires retaining each selected venv's original base. Explicit commands retain
-the per-venv and separate-target behavior described above.
+The no-argument mode collects any per-venv base choices and then one Enter
+confirmation for the displayed batch, including raw installations. Target
+preparation follows batch approval. Explicit commands retain their per-venv
+confirmation and separate-target behavior.
 
 Use `-Y` for unattended updates. The option is accepted before or after `apply`:
 
@@ -356,6 +367,15 @@ dependencies are reported after logging starts. Logging itself needs GNU
 coreutils and Bash.
 
 ## Validation
+
+The base-choice regression driver takes a private CPython binary and an optional
+compatible replacement from the same minor series. It exercises a readable
+original excluded by the ownership check, per-venv decisions, batch consent,
+an existing cached target, target preparation, verification and rollback.
+
+```bash
+bash tests/python-updater-base-choice.bash /path/to/private/bin/python3.13
+```
 
 ### November 15 interactive scan choices
 

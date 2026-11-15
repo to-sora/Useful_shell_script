@@ -79,8 +79,9 @@ With no arguments, scan SSD/memory mounts and ask [y/N] for each uncertain local
 mount before discovery. Scan permission covers that mount for this run.
 If no mounts qualify and HOME is on a reported HDD, offer to scan HOME only.
 Review the resulting plan and press Enter to approve the updates.
-Original Python and venv base paths are required in this mode. No installer changes
-or installation registry are needed. Explicit commands retain their HOME default.
+Installation paths are retained. If a venv's original base cannot be used,
+Enter skips that venv; y offers it for update using a compatible private base.
+Explicit commands retain their HOME default.
 HDDs are excluded from automatic scans. Loops and unsupported filesystems
 are excluded. Explicit commands skip HDDs and uncertain media.
 Plan/apply use the adjacent installer's release pins.
@@ -344,7 +345,10 @@ runpy() {
   timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@" </dev/null
 }
 config_value() {
-  awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= \"/, "");sub(/\"$/, "");print;exit}' "$1"
+  awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= "/, "");sub(/"$/, "");print;exit}' "$1"
+}
+venv_home() {
+  awk '/^home[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$1"
 }
 # The sysconfig module CLI supplies identity and ABI without inline code.
 probe() {
@@ -368,7 +372,7 @@ probe() {
   bits="$(config_value "$report" SIZEOF_VOID_P)"
   pure="$(config_value "$report" purelib)"
   plat="$(config_value "$report" platlib)"
-  machine="$(awk '/^Platform:/ {sub(/^Platform: \"/, "");sub(/\"$/, "");print;exit}' "$report")"
+  machine="$(awk '/^Platform:/ {sub(/^Platform: "/, "");sub(/"$/, "");print;exit}' "$report")"
   rm -f -- "$report"
   [[ $prefix == /* && $base == /* && $abi == cpython-* && $bits =~ ^[0-9]+$ && $shared =~ ^[01]$ ]] || return 1
   prefix="$(canonical "$prefix")"
@@ -540,7 +544,7 @@ scan() {
         storage_warning "$resolved"
         continue
       fi
-      base="$(awk '/^home[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$prefix/pyvenv.cfg")"
+      base="$(venv_home "$prefix/pyvenv.cfg")"
     fi
     flag=0
     for root in "$prefix/lib" "$prefix/lib64" "$base"; do
@@ -583,6 +587,7 @@ scan() {
       continue
     fi
     identities[$identity]=$prefix
+    info="$(jq -c --arg id "$identity" '.prefix_identity=$id' <<<"$info")"
     base="$(jq -r .base_prefix <<<"$info")"
     if scan_path_allowed "$(realpath -m -- "$base/bin/python$(minor "$(jq -r .version <<<"$info")")")"; then
       jq -c '.+{base_in_scope:true}' <<<"$info" >>"$WORK/probes.ndjson"
@@ -805,39 +810,88 @@ make_plan() {
     '{engine:"bash",inventory:$inventory[0],plan:($plan|sort_by(.kind!="raw",.prefix))}' | atomic_write "$destination"
 }
 
-# Interactive updates keep the original raw base. The advanced, explicitly
-# scoped commands retain their separate-target behavior for rebuild workflows.
-require_original_bases() {
-  local plan=$1 errors
-  errors="$(jq -r '
-    .plan as $all | .plan[] | select(.action=="update" or .action=="prepare_target") |
-    if .kind=="venv" then . as $venv |
-      [$all[]|select(.kind=="raw" and .prefix==$venv.base_prefix and
-        (.action=="update" or .action=="prepare_target" or .reason=="up_to_date") and
-        (.target.version//.requested_version)==($venv.target.version//$venv.requested_version))] |
-      if length==1 then empty else "Original base unavailable for " + $venv.prefix + ": " + $venv.base_prefix end
-    else . as $raw | $all[] | select(.kind=="venv" and .base_prefix==$raw.prefix and .action=="skip") |
-      "Dependent venv blocks original base " + $raw.prefix + ": " + .prefix + " (" + .reason + ")" end' "$plan")"
-  [[ -z $errors ]] || die "$errors"
-  json_edit "$plan" '.plan |= map(if .kind=="venv" and (.action=="update" or .action=="prepare_target")
-    then .required_base=.base_prefix else . end)'
+# Mark which venvs can retain their original base. A skipped dependent must
+# keep its raw base unchanged even if another venv accepts a separate target.
+plan_interactive_bases() {
+  json_edit "$1" '
+    def pending: .action=="update" or .action=="prepare_target";
+    def goal: .target.version // .requested_version;
+    .plan as $all | .inventory.warnings as $warnings |
+    .plan |= map(. as $raw | if .kind=="raw" and pending and any($all[];
+        .kind=="venv" and .base_prefix==$raw.prefix and (.action=="skip" or goal!=($raw|goal)))
+      then .action="skip" | .reason="Dependent venv requires the original base to remain unchanged"
+      else . end) |
+    (.plan | map(select(.kind=="raw")) | INDEX(.prefix)) as $raws |
+    .plan |= map(if .kind=="venv" and pending then
+      . as $v | $raws[.base_prefix] as $raw |
+      if .target.prefix==.base_prefix or
+        ($raw!=null and (($raw|pending) or $raw.reason=="up_to_date") and ($raw|goal)==goal)
+      then .required_base=.base_prefix
+      else .base_issue=(if $raw!=null then ($raw.reason | select(length>0)) // "Original base has a different target version"
+        else ([$warnings[]? | select(.path==$v.base_prefix or (.path|startswith($v.base_prefix+"/bin/"))) | .reason] | unique | join(". ")) as $why |
+          if $why=="" then "Original base has no raw installation in the scan" else $why end end)
+      end else . end)'
+}
+choose_replacement_bases() {
+  local plan=$1 item prefix old destination version reason answer decision input_fd
+  : >"$WORK/base-choices.ndjson"
+  exec {input_fd}<&0
+  while IFS= read -r item; do
+    prefix=$(jq -r .prefix <<<"$item")
+    old=$(jq -r .base_prefix <<<"$item")
+    version=$(jq -r '.target.version//.requested_version' <<<"$item")
+    destination=$(jq -r --arg cache "$RUNTIME_DIR" '.target.prefix // ("a new private runtime under " + $cache)' <<<"$item")
+    reason=$(jq -r .base_issue <<<"$item")
+    printf '\nVenv: %s\nOriginal base: %s (%s)\nReplacement base: Python %s, %s\n' "$prefix" "$old" "$reason" "$version" "$destination" >&2
+    while true; do
+      printf 'Use the replacement base for this venv at its existing path? [y/N] ' >&2
+      if ! IFS= read -r -u "$input_fd" answer; then
+        printf '\n' >&2
+        die 'Base selection input ended; no targets prepared or environments updated'
+      fi
+      case "${answer,,}" in
+        y | yes) decision=replacement; break ;;
+        '' | n | no) decision=skipped; break ;;
+        *) printf 'Enter y to use the replacement or n to skip this venv.\n' >&2 ;;
+      esac
+    done
+    event base_choice "$prefix" "$decision"
+    jq -cn --arg prefix "$prefix" --arg choice "$decision" '{prefix:$prefix,choice:$choice}' >>"$WORK/base-choices.ndjson"
+  done < <(jq -c '.plan[]|select(.base_issue!=null)' "$plan")
+  exec {input_fd}<&-
+}
+apply_base_choices() {
+  json_edit "$1" --slurpfile choices "$WORK/base-choices.ndjson" '
+    ($choices|INDEX(.prefix)) as $by_prefix |
+    .plan |= map(($by_prefix[.prefix].choice) as $choice |
+      if $choice=="skipped" then .base_choice=$choice | .action="skip" | .reason="Replacement base declined"
+      elif $choice=="replacement" then .base_choice=$choice | .required_base=.target.prefix
+      elif .base_issue!=null then .action="skip" | .reason=.base_issue
+      else . end)'
 }
 confirm_interactive() {
   local plan=$1 answer count
-  printf '\nDiscovered environments (original paths are retained):\n' >&2
-  jq -r '.plan[]|[.kind,.prefix,(.version+" -> "+(.target.version//.requested_version)),.action,.reason]|@tsv' "$plan" >&2
+  plan_interactive_bases "$plan"
+  cp -- "$plan" "$LOG_DIR/plan.json"
+  choose_replacement_bases "$plan"
+  apply_base_choices "$plan"
+  cp -- "$plan" "$LOG_DIR/plan.json"
+  printf '\nDiscovered environments (installation paths are retained):\n' >&2
+  jq -r --arg cache "$RUNTIME_DIR" '.plan[]|
+    [.kind,.prefix,(.version+" -> "+(.target.version//.requested_version)),.action,.reason] +
+    (if .base_choice=="replacement" then ["base: "+.base_prefix+" -> "+(.target.prefix//("new build under "+$cache))]
+     else [] end) | @tsv' "$plan" >&2
   printf '\nStorage inventory: %s/storage.json\n' "$LOG_DIR" >&2
   count="$(jq '[.plan[]|select(.action=="update" or .action=="prepare_target")]|length' "$plan")"
   if ((count == 0)); then
     event no_updates '' 'Review plan.json and inventory.json for exclusions and skip reasons'
-    return 1
+    return 0
   fi
   if jq -e 'any(.plan[];.action=="prepare_target")' "$plan" >/dev/null && ! storage_allowed "$RUNTIME_DIR"; then
     die "A target build needs an eligible cache mount for $RUNTIME_DIR. Run again with XDG_DATA_HOME on a mount included for discovery."
   fi
-  require_original_bases "$plan"
   jq '[.plan[]|select(.action=="update" or .action=="prepare_target")|
-    {prefix,version,target_version:(.target.version//.requested_version),required_base}]' "$plan" >"$WORK/approved-intent.json"
+    {prefix,kind,version,base_prefix,target_version:(.target.version//.requested_version),base_choice,required_base}]' "$plan" >"$WORK/approved-intent.json"
   printf '\nStop applications using these environments. Update %s environments at their original paths? [Enter=yes, n=cancel] ' "$count" >&2
   if ! IFS= read -r answer; then
     printf '\n' >&2
@@ -850,18 +904,29 @@ confirm_interactive() {
       ;;
     *)
       event cancelled '' 'No targets prepared or environments updated'
-      return 1
+      return 0
       ;;
   esac
 }
 check_interactive_plan() {
   local plan=$1
-  require_original_bases "$plan"
-  jq -e --slurpfile intent "$WORK/approved-intent.json" '
-    .plan as $plan | all($intent[0][]; . as $expected |
-      any($plan[]; .prefix==$expected.prefix and .version==$expected.version and
-        .action=="update" and .target.version==$expected.target_version and
-        .required_base==$expected.required_base))' "$plan" >/dev/null || die 'Prepared targets changed the approved plan; no environments updated'
+  plan_interactive_bases "$plan"
+  apply_base_choices "$plan"
+  cp -- "$plan" "$LOG_DIR/plan.json"
+  if ! jq -e --arg cache "$RUNTIME_DIR" --slurpfile intent "$WORK/approved-intent.json" '
+    [.plan[]|select(.action=="update" or .action=="prepare_target")] as $updates |
+    ($updates|length)==($intent[0]|length) and all($intent[0][]; . as $expected |
+      any($updates[]; .action=="update" and .prefix==$expected.prefix and .kind==$expected.kind and
+        .version==$expected.version and .base_prefix==$expected.base_prefix and
+        .target.version==$expected.target_version and .base_choice==$expected.base_choice and
+        (if $expected.base_choice=="replacement" and $expected.required_base==null then
+          .target.source=="installed" and .required_base==.target.prefix and (.required_base|startswith($cache+"/"))
+         else .required_base==$expected.required_base end)))' "$plan" >/dev/null; then
+    jq -r --slurpfile intent "$WORK/approved-intent.json" '
+      ($intent[0]|INDEX(.prefix)) as $approved | .plan[] |
+      select($approved[.prefix]!=null and .action=="skip") | "\(.prefix): \(.reason)"' "$plan" >&2
+    die "Prepared targets changed the approved plan; no environments updated. See $LOG_DIR/plan.json"
+  fi
 }
 
 confirm_plan() {
@@ -1168,7 +1233,8 @@ patch_stage() {
     done < <(find "$stage/bin" -mindepth 1 -maxdepth 1 -name 'python*' -print0)
     base="$(jq -r .base_prefix "$entry")"
     candidate=$base/bin/python$mm
-    if [[ $(jq -r '.base_in_scope//false' "$entry") == true ]] && info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
+    if jq -e '.base_in_scope==true and .base_choice!="replacement"' "$entry" >/dev/null &&
+      info="$(probe "$candidate")" && [[ $(jq -r .version <<<"$info") == "$version" ]]; then target=$candidate; fi
     if awk -F= '$1~/^include-system-site-packages *$/ && $2~/true/ {found=1} END{exit !found}' "$stage/pyvenv.cfg"; then options+=(--system-site-packages); fi
     # venv rewrites pyvenv.cfg on upgrade. Preserve CPython's verbatim prompt
     # record (including quotes and escapes) without sourcing or decoding it.
@@ -1302,6 +1368,27 @@ rollback_entries() {
   done < <(jq -c '.entries|reverse[]' "$journal")
   return "$failed"
 }
+# The installer can take time. Check the live source under its update lock
+# before recording or applying an approved change to a venv's base.
+replacement_source_matches() {
+  local item=$1 prefix binary config_home path live
+  prefix="$(jq -r .prefix <<<"$item")"
+  binary="$(jq -r .binary <<<"$item")"
+  [[ -d $prefix && ! -L $prefix && ! -L $prefix/bin && ! -L $prefix/lib &&
+    -f $prefix/pyvenv.cfg && ! -L $prefix/pyvenv.cfg ]] || return 1
+  [[ $(stat -Lc '%d:%i' -- "$prefix") == "$(jq -r .prefix_identity <<<"$item")" &&
+    $(stat -Lc %u -- "$prefix") == "$EUID" ]] || return 1
+  scan_path_allowed "$(realpath -m -- "$binary")" || return 1
+  storage_allowed "$prefix/pyvenv.cfg" || return 1
+  config_home="$(venv_home "$prefix/pyvenv.cfg")" || return 1
+  for path in "$prefix/lib" "$prefix/lib64" "$config_home"; do
+    [[ -z $path ]] || storage_allowed "$(realpath -m -- "$path")" || return 1
+  done
+  live="$(probe "$binary")" || return 1
+  jq -e --argjson expected "$item" '
+    def identity: [.kind,.prefix,.base_prefix,.version,.soabi,.shared,.pointer_bits,.machine,.managed];
+    identity==($expected|identity)' <<<"$live" >/dev/null
+}
 apply_plan() {
   local plan=$1 journal=$2 item prefix snapshot path token stage backup count=0 failed=0 fatal=0 base
   local -A blocked=()
@@ -1309,6 +1396,9 @@ apply_plan() {
   jq '[.plan[]|select(.action=="update")]' "$plan" >"$WORK/lock-list.json"
   assert_control_paths "$WORK/lock-list.json" "$journal" "$journal.entries" "$journal.post-verify.json" "$LOG_DIR" "$WORK"
   acquire_locks "$WORK/lock-list.json"
+  while IFS= read -r item; do
+    replacement_source_matches "$item" || die "Venv changed since base selection: $(jq -r .prefix <<<"$item"). Start a new run to review it; no environments updated."
+  done < <(jq -c '.plan[]|select(.action=="update" and .base_choice=="replacement")' "$plan")
   confirm_plan "$plan" "$WORK/confirmed-plan.json"
   plan="$WORK/confirmed-plan.json"
   cp -- "$plan" "$LOG_DIR/approved-plan.json"
@@ -1549,8 +1639,8 @@ main() {
       discover_targets "$WORK/inventory.json"
       make_plan "$WORK/inventory.json" "$WORK/plan.json"
       if ((INTERACTIVE)); then
-        cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
-        if ! confirm_interactive "$WORK/plan.json"; then return; fi
+        confirm_interactive "$WORK/plan.json"
+        ((BATCH_APPROVED)) || return 0
       fi
       if [[ $COMMAND == apply ]]; then
         cp -- "$WORK/plan.json" "$LOG_DIR/plan.json"
