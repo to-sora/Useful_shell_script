@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Storage fixtures exercise real find/pruning without mounting or probing disks.
-# Optional old/patched private CPython binaries enable the complete Enter workflow.
+# Optional old/patched private CPython binaries exercise selective updates.
 set -Eeuo pipefail
 [[ $# == 0 || $# == 2 ]] || {
   echo 'Usage: bash tests/python-updater-interactive.bash [OLD_BIN PATCHED_BIN]' >&2
@@ -317,7 +317,7 @@ jq -e '([.[]|select(.class=="hdd" and .scan_choice=="skipped")]|length)==2' "${j
 echo 'PASS: mount-specific yes/no/default, incomplete inputs, hard exclusions and explicit commands'
 unset DISCOVERY_TEST_VM
 mv "$lab/normal-disks.json" "$DISCOVERY_DISKS"
-# The remaining Enter-only scenarios exercise automatic, known media.
+# The remaining per-environment choices exercise automatic, known media.
 jq --arg hidden "$lab/hidden-backing" '.filesystems |= map(select(.target!=$hidden))' "$lab/normal-mounts.json" >"$DISCOVERY_MOUNTS"
 (($# == 2)) || exit 0
 
@@ -328,6 +328,8 @@ version=$("$target" -I --version)
 minor=${version#Python }
 minor=${minor%.*}
 [[ $old_version == "Python $minor."* && $old_version != "$version" ]]
+shared=$("$old" -I -m sysconfig | awk '$1=="Py_ENABLE_SHARED" {gsub(/"/,"",$3);print $3;exit}')
+[[ $shared == 0 || $shared == 1 ]]
 export DISCOVERY_TARGET="$target" DISCOVERY_INSTALLER="${updater%/*}/install_python.sh"
 export DISCOVERY_CALLS="$lab/build-calls"
 export XDG_DATA_HOME="$lab/ssd/data"
@@ -344,7 +346,7 @@ while (($#)); do
   case "$1" in
     --py) selected=$2; shift 2 ;;
     --jobs) shift 2 ;;
-    --reuse|--skip-conda|--no-bashrc|--skip-apt|--no-sudo) shift ;;
+    --reuse|--skip-conda|--no-bashrc|--skip-apt|--no-sudo|--enable-shared) shift ;;
     *) exit 1 ;;
   esac
 done
@@ -369,10 +371,10 @@ sha256sum "$DISCOVERY_INSTALLER" >"$lab/installer-hash"
 # Agreeing to scan an unknown mount does not approve its updates.
 cp "$DISCOVERY_MOUNTS" "$lab/known-only.json"
 jq --arg path "$lab/ssd" '(.filesystems[]|select(.target==$path))["maj:min"]="252:99"' "$lab/known-only.json" >"$DISCOVERY_MOUNTS"
-printf 'y\nn\n' | run >"$lab/ask-then-cancel-output" 2>&1
+printf 'y\nno\nno\nno\nno\n' | run >"$lab/ask-then-cancel-output" 2>&1
 journal=$(output_path "$lab/ask-then-cancel-output")
 jq -e --arg path "$lab/ssd" 'any(.[];.path==$path and .scan_choice=="approved")' "${journal%/*}/storage.json" >/dev/null
-jq -e --arg prefix "$lab/ssd/install/env with spaces" 'any(.plan[];.prefix==$prefix and (.action=="prepare_target" or .action=="update"))' "${journal%/*}/plan.json" >/dev/null
+jq -e --arg prefix "$lab/ssd/install/env with spaces" 'any(.plan[];.prefix==$prefix and .action=="skip" and .approval=="declined")' "${journal%/*}/plan.json" >/dev/null
 grep -F '"event":"cancelled"' "$lab/ask-then-cancel-output" >/dev/null
 [[ ! -e $DISCOVERY_CALLS && ! -e $journal ]]
 [[ $("$lab/ssd/install/env with spaces/bin/python" -I --version) == "$old_version" ]]
@@ -382,27 +384,28 @@ printf 'y\n' | run >"$lab/ask-then-eof-output" 2>&1 || status=$?
 grep -F 'Confirmation input ended' "$lab/ask-then-eof-output" >/dev/null
 mv "$lab/known-only.json" "$DISCOVERY_MOUNTS"
 status=0
-XDG_DATA_HOME="$lab/alias-hdd/cache" run </dev/null >"$lab/denied-cache-output" 2>&1 || status=$?
+printf 'yes\nyes\nyes\nyes\n' | XDG_DATA_HOME="$lab/alias-hdd/cache" run >"$lab/denied-cache-output" 2>&1 || status=$?
 [[ $status == 2 && ! -e $DISCOVERY_CALLS && ! -e $lab/alias-hdd/cache && ! -e $(output_path "$lab/denied-cache-output") ]]
 grep -F 'A target build needs an eligible cache mount' "$lab/denied-cache-output" >/dev/null
 bad run </dev/null >"$lab/eof-output" 2>&1
 grep -F 'Confirmation input ended' "$lab/eof-output" >/dev/null
 [[ ! -e $DISCOVERY_CALLS && ! -e $(output_path "$lab/eof-output") ]]
-printf 'n\n' | run >"$lab/cancel-output" 2>&1
+printf '\n\n\n\n' | run >"$lab/cancel-output" 2>&1
 [[ ! -e $DISCOVERY_CALLS ]]
 
-# Enter is the complete input, with zero CLI arguments. It approves both raw
-# installations and venvs before preparing any target runtime.
+# Each eligible installation and venv receives a separate approval before building.
 : >"$DISCOVERY_PROBES"
-printf '\n' | run >"$lab/enter-output" 2>&1
+printf 'yes\nY\ny\nYES\n' | run >"$lab/enter-output" 2>&1
 journal=$(output_path "$lab/enter-output")
-jq -e '.failures==0 and (.entries|length)==4 and all(.entries[];.status=="verified") and
-  all(.entries[]|select(.kind=="venv");.required_base==.base_prefix and .approval=="confirmed")' "$journal" >/dev/null
+jq -e --argjson shared "$shared" '.failures==0 and (.entries|length)==(if $shared==0 then 4 else 2 end)
+  and all(.entries[];.status=="verified" and .approval=="confirmed")
+  and all(.entries[]|select(.kind=="venv"); if $shared==0 then .required_base==.base_prefix else .base_choice=="replacement" end)' "$journal" >/dev/null
+[[ $(grep -c '^Update venv ' "$lab/enter-output") == 2 ]]
 [[ $(wc -l <"$DISCOVERY_CALLS") == 1 ]]
 bad grep -E '/(hdd/env|ssd/hdd|ssd/raid|ssd/loop|ssd/unknown)/|python999' "$DISCOVERY_PROBES"
 for place in ssd/install hdd/ssd/old-install; do
   base="$lab/$place"
-  [[ $("$base/bin/python-$minor" -I --version) == "$version" ]]
+  if [[ $shared == 0 ]]; then [[ $("$base/bin/python-$minor" -I --version) == "$version" ]]; else [[ $("$base/bin/python-$minor" -I --version) == "$old_version" ]]; fi
   [[ $("$base/env with spaces/bin/python" -I --version) == "$version" ]]
 done
 run verify "$journal" --output "$lab/verified.json" >"$lab/verify-output" 2>&1
@@ -423,4 +426,18 @@ for place in ssd/install hdd/ssd/old-install; do
   [[ $("$base/env with spaces/bin/python" -I --version) == "$old_version" ]]
 done
 
-echo 'PASS: no-argument Enter workflow, legacy installs, separate SSD mounts, EOF/cancel before builds, original bases, entrypoints, verification and rollback'
+if [[ $shared == 0 ]]; then
+  # The first raw is declined. The second is approved, but a declined sibling
+  # must protect it, so the first approved sibling gets a new base choice.
+  original="$lab/ssd/install/opt/python-${old_version#Python }"
+  sibling="$lab/ssd/install/sibling"
+  "$original/bin/${old##*/}" -I -m venv --copies --without-pip "$sibling"
+  printf 'no\nyes\nno\nyes\nno\nyes\n' | run >"$lab/mixed-output" 2>&1
+  journal=$(output_path "$lab/mixed-output")
+  jq -e --arg p "$lab/ssd/install/env with spaces" --arg orig "$original" --arg sib "$sibling" '
+    .failures==0 and (.entries|length)==1 and (.entries[0]|.prefix==$p and .base_choice=="replacement" and .required_base!=$orig)
+    and any(.skipped[];.prefix==$sib) and any(.skipped[];.prefix==$orig)' "$journal" >/dev/null
+  [[ $("$original/bin/${old##*/}" -I --version) == "$old_version" && $("$sibling/bin/python" -I --version) == "$old_version" ]]
+  run rollback "$journal" >"$lab/mixed-rollback" 2>&1
+fi
+echo 'PASS: individual choices, shared-base protection, separate mounts, EOF/cancel before builds, verification and rollback'

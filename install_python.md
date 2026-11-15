@@ -9,9 +9,9 @@ Install multiple Python versions from source and Miniforge (conda) on Ubuntu.
 - `sudo` access for apt package installation (unless using `--skip-apt` and `--no-sudo`)
 
 ## What it installs
-- **Python versions**: 3.11.18 and 3.13.18 by default; 3.8.20 and 3.10.22 through explicit `--py` selection (compiled from source)
+- **Python versions**: 3.11.18 and 3.13.18 by default; 3.8.20, 3.10.22 and 3.12.16 through explicit `--py` selection (compiled from source)
 - **Miniforge**: 26.9.4-1 (conda/mamba package manager)
-- **Entry scripts**: `py38`, `py10`, `py11`, `py13`, `python3-8`, `pip3-11`, etc.
+- **Entry scripts**: `py38`, `py10`, `py11`, `py12`, `py13`, `python3-8`, `pip3-11`, etc.
 - **Conda wrappers**: `cbase` (base environment), `cenv <envname>` (activate environment)
 - **Cache directories**: Pre-configured for pip, HuggingFace, torch, ollama
 
@@ -34,6 +34,7 @@ Install multiple Python versions from source and Miniforge (conda) on Ubuntu.
 | `--no-bashrc` | Do not modify `~/.bashrc` with PATH additions |
 | `--no-sudo` | Do not use sudo (for environments without sudo access) |
 | `--py "3.13 3.11"` | Select Python branches; 3.11 and 3.13 are the default |
+| `--enable-shared` | Build a private shared libpython for matching venvs |
 | `--skip-conda` | Build CPython without installing or updating Miniforge |
 | `--jobs N` | Set compilation workers; default is `nproc` |
 
@@ -47,11 +48,12 @@ Install multiple Python versions from source and Miniforge (conda) on Ubuntu.
 After installation, `BASE_DIR` will contain:
 ```
 BASE_DIR/
-├── bin/           # Entry scripts: py38, py11, py13, cbase, cenv, conda
+├── bin/           # Entry scripts: py38, py11, py12, py13, cbase, cenv, conda
 ├── opt/           # Installed Python versions and Miniforge
 │   ├── python-3.8.20/
 │   ├── python-3.10.22/
 │   ├── python-3.11.18/
+│   ├── python-3.12.16/
 │   ├── python-3.13.18/
 │   └── conda/     # Miniforge installation
 ├── src/           # Python source tarballs
@@ -130,8 +132,8 @@ installer and updater. This command runs without preparing an installation.
 bash install_python.sh /path/to/patched-runtimes --skip-conda --jobs 4 --no-bashrc
 ```
 
-Release policy checked on 2026-11-02. Python 3.8 and 3.10 have reached end of
+The 3.12 branch targets 3.12.16. Python 3.8 and 3.10 have reached end of
 support. Their final patch releases require explicit selection and emit a
 warning. Migration to a supported branch is required for ongoing security
-maintenance. The CPython updater delegates existing Conda environments to the
-Conda solver.
+maintenance. The updater asks about existing Conda environments separately and
+uses their solver to apply approved patch transactions.

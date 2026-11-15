@@ -40,7 +40,7 @@ while (($#)); do
   case "$1" in
     --py) selected=$2; shift 2 ;;
     --jobs) [[ $2 =~ ^[1-9][0-9]*$ ]]; shift 2 ;;
-    --reuse | --skip-conda | --no-bashrc | --skip-apt | --no-sudo) shift ;;
+    --reuse | --skip-conda | --no-bashrc | --skip-apt | --no-sudo | --enable-shared) shift ;;
     *) echo "Unexpected installer option: $1" >&2; exit 26 ;;
   esac
 done

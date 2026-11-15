@@ -82,26 +82,28 @@ sha256sum "$FIXTURE_ORIGINAL/bin/python$mm" "$venv/bin/activate" "$site/project_
 printf 'y\n\n' | run
 journal=$(output_path)
 grep -F 'Prefix owned by another account' "$lab/last.out" >/dev/null
-grep -F '"event":"no_updates"' "$lab/last.out" >/dev/null
+grep -F '"event":"cancelled"' "$lab/last.out" >/dev/null
 jq -e --arg p "$venv" 'any(.plan[];.prefix==$p and .action=="skip" and .base_choice=="skipped")' "${journal%/*}/plan.json" >/dev/null
 [[ ! -e $journal && ! -e $FIXTURE_BUILDS ]]
-for replies in 'y\n' 'y\ny\n'; do
-  status=0
-  printf '%b' "$replies" | run || status=$?
-  [[ $status == 2 && ! -e $(output_path) && ! -e $FIXTURE_BUILDS ]]
-done
-printf 'y\ninvalid\ny\nn\n' | run
-grep -F 'Enter y to use the replacement' "$lab/last.out" >/dev/null
+status=0
+printf 'y\n' | run || status=$?
+[[ $status == 2 && ! -e $(output_path) && ! -e $FIXTURE_BUILDS ]]
+printf 'y\ninvalid\nno\n' | run
+grep -F 'Enter y/yes to update' "$lab/last.out" >/dev/null
 grep -F '"event":"cancelled"' "$lab/last.out" >/dev/null
 [[ ! -e $(output_path) && $(base_of "$venv") == "$FIXTURE_ORIGINAL" ]]
 
 other="$user_dir/z-project/venv"
 "$FIXTURE_ORIGINAL/bin/python$mm" -I -m venv --copies --without-pip "$other"
 ln -sfn keep-this-alias "$other/bin/python3"
+status=0
+printf 'y\nyes\n' | run || status=$?
+[[ $status == 2 && ! -e $(output_path) && ! -e $FIXTURE_BUILDS ]]
 for path_kind in cached prepared; do
   if [[ $path_kind == prepared ]]; then rm -- "$runtime/targets.json"; fi
-  printf 'y\ny\nn\n\n' | run
+  printf 'y\nyes\nNO\n' | run
   journal=$(output_path)
+  [[ $(grep -c '^Update venv ' "$lab/last.out") == 2 ]]
   if [[ $path_kind == cached ]]; then
     expected="$runtime/known-target"
     [[ ! -e $FIXTURE_BUILDS ]]
@@ -134,7 +136,7 @@ rm -- "$runtime/targets.json"
 cp -a -- "$old_tree" "$runtime/other-original"
 export FIXTURE_CHANGED_HOME="$runtime/other-original/bin"
 status=0
-printf 'y\ny\nn\n\n' | run || status=$?
+printf 'y\nyes\nno\n' | run || status=$?
 [[ $status == 2 && ! -e $(output_path) && $(base_of "$venv") == "$runtime/other-original" ]]
-grep -F 'Venv changed since base selection' "$lab/last.out" >/dev/null
-echo 'PASS: skip/EOF, independent base and batch consent, cached and built replacement, verify/rollback and concurrent base changes'
+grep -F 'Environment changed since selection' "$lab/last.out" >/dev/null
+echo 'PASS: individual yes/no/empty/EOF, cached and built replacement, verify/rollback and concurrent base changes'
