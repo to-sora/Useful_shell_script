@@ -11,6 +11,7 @@ lab=$(mktemp -d)
 trap 'status=$?; if ((status)); then tail -n 25 "$lab/"*-output >&2; fi; rm -rf -- "$lab"' EXIT
 mkdir -p "$lab/tools" "$lab/scripts" "$lab/ssd/hdd" "$lab/ssd/unknown" "$lab/ssd/raid" "$lab/ssd/loop" "$lab/hdd/ssd" "$lab/alias-hdd" "$lab/memory"
 cp -- "$updater" "$lab/scripts/update_python_envs.sh"
+cp -- "${updater%/*}/install_python.sh" "$lab/scripts/install_python.sh"
 export DISCOVERY_MOUNTS="$lab/mounts.json" DISCOVERY_DISKS="$lab/disks.json"
 export DISCOVERY_PROBES="$lab/probes" DISCOVERY_TIMEOUT
 export DISCOVERY_FIND DISCOVERY_VISITS="$lab/visits" DISCOVERY_WALKS="$lab/walks"
@@ -132,27 +133,65 @@ jq -e '.environments==[] and any(.warnings[];.reason=="Storage excluded: unknown
 grep -F 'lsblk: test sysfs unavailable' "$(sed -n 's/^Log: //p' "$lab/unknown-output")" >/dev/null
 cp "$lab/lsblk.original" "$lab/tools/lsblk"
 
-# A machine may have only a physical HDD root, system tmpfs directories
-# and file bind mounts. No directory walk, build, or journal should start.
+# Reproduce the reported Ubuntu root: ext4 on dm-1 (253:1), classified HDD.
+# Only HOME on that mount can be selected. An alias on the same device, a
+# nested mount and a nested file mount on memory must not inherit permission.
 cp "$DISCOVERY_MOUNTS" "$lab/eligible-mounts.json"
+cp "$DISCOVERY_DISKS" "$lab/eligible-disks.json"
+rot_home="$lab/home/vmadmin"
+for path in "$rot_home/local" "$rot_home/nested/env" "$rot_home-neighbor/env" "$rot_home/copied" "$rot_home/file-config"; do canary "$path"; done
+ln -s "$rot_home-neighbor/env/bin/python" "$rot_home/local/bin/python888"
+printf 'home = %s/bin\n' "$rot_home-neighbor/env" >"$rot_home/copied/pyvenv.cfg"
+cat >"$DISCOVERY_DISKS" <<'JSON'
+{"blockdevices":[{"name":"dm-1","maj:min":"253:1","type":"lvm","rota":false,"children":[
+  {"name":"sda3","maj:min":"8:3","type":"part","rota":true,"children":[
+    {"name":"sda","maj:min":"8:0","type":"disk","rota":true,"vendor":"ATA","model":"ST1000"}]}]}]}
+JSON
 touch "$lab/file-mount"
-jq -n --arg file "$lab/file-mount" '{filesystems:[
- {target:"/",fstype:"ext4","maj:min":"8:17"},
+jq -n --arg file "$lab/file-mount" --arg home "$rot_home" '{filesystems:[
+ {target:"/",fstype:"ext4","maj:min":"253:1"},
+ {target:($home+"/nested"),fstype:"ext4","maj:min":"253:1"},
+ {target:($home+"/file-config/pyvenv.cfg"),fstype:"tmpfs","maj:min":"0:89"},
  {target:"/dev/shm",fstype:"tmpfs","maj:min":"0:11"},
  {target:"/run",fstype:"tmpfs","maj:min":"0:12"},
  {target:$file,fstype:"tmpfs","maj:min":"0:13"}
 ]}' >"$DISCOVERY_MOUNTS"
 : >"$DISCOVERY_VISITS"
+: >"$DISCOVERY_WALKS"
 status=0
-XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/no-roots-output" 2>&1 || status=$?
+HOME="$rot_home" XDG_DATA_HOME="$rot_home/data" run </dev/null >"$lab/no-roots-output" 2>&1 || status=$?
 [[ $status == 2 && ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES ]]
 journal=$(output_path "$lab/no-roots-output")
 [[ -n $journal && ! -e $journal ]]
 storage=${journal%/*}/storage.json
 grep -F "Storage inventory: $storage" "$lab/no-roots-output" >/dev/null
-grep -F 'mount /, filesystem ext4, device 8:17, class hdd' "$lab/no-roots-output" >/dev/null
-jq -e 'any(.[];.path=="/" and .class=="hdd" and .device=="8:17")' "$storage" >/dev/null
+grep -F '/ (ext4, device 253:1, class hdd' "$lab/no-roots-output" >/dev/null
+grep -F "Scan $rot_home for Python environments? [y/N]" "$lab/no-roots-output" >/dev/null
+jq -e --arg home "$rot_home" 'any(.[];.path=="/" and .class=="hdd" and .device=="253:1" and .scan_scope==$home and .scan_choice=="input_ended")' "$storage" >/dev/null
 bad grep -E '"event":"(scan_started|target_build_started|prepare)"' "$lab/no-roots-output"
+for answer in '' n; do
+  printf '%s\n' "$answer" | HOME="$rot_home" XDG_DATA_HOME="$rot_home/data" run >"$lab/home-skip-output" 2>&1
+  grep -F '"event":"no_scan"' "$lab/home-skip-output" >/dev/null
+  [[ ! -s $DISCOVERY_WALKS && ! -s $DISCOVERY_PROBES && ! -e $(output_path "$lab/home-skip-output") ]]
+done
+printf 'y\n' | HOME="$rot_home" XDG_DATA_HOME="$rot_home/data" run >"$lab/home-yes-output" 2>&1
+journal=$(output_path "$lab/home-yes-output")
+jq -e --arg home "$rot_home" 'any(.[];.path=="/" and .class=="hdd" and .scan_choice=="approved" and .scan_scope==$home)' "${journal%/*}/storage.json" >/dev/null
+[[ $(cat "$DISCOVERY_WALKS") == "$rot_home" ]]
+grep -F "$rot_home/local/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
+bad grep -E 'python888|/copied/|/nested/|/file-config/|-neighbor/' "$DISCOVERY_PROBES"
+bad grep -F "$rot_home/nested/env" "$DISCOVERY_VISITS"
+grep -F '"event":"no_updates"' "$lab/home-yes-output" >/dev/null
+[[ ! -e $journal ]]
+for invalid_home in / /usr; do
+  status=0
+  HOME="$invalid_home" XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/system-home-output" 2>&1 || status=$?
+  [[ $status == 2 ]]
+  bad grep -F 'for Python environments? [y/N]' "$lab/system-home-output"
+done
+: >"$DISCOVERY_PROBES"
+: >"$DISCOVERY_VISITS"
+: >"$DISCOVERY_WALKS"
 
 # HOME can be a separate mount whose device is hidden from the guest.
 home_path=$(realpath -m -- "$HOME")
@@ -172,16 +211,16 @@ printf '\n' | XDG_DATA_HOME="$lab/data" run >"$lab/skip-home-output" 2>&1
 grep -F '"event":"no_scan"' "$lab/skip-home-output" >/dev/null
 [[ ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES && ! -e $(output_path "$lab/skip-home-output") ]]
 mv "$lab/eligible-mounts.json" "$DISCOVERY_MOUNTS"
+mv "$lab/eligible-disks.json" "$DISCOVERY_DISKS"
 
 # The normal zero-argument entry point must reach discovery on a guest SSD.
-cp -- "${updater%/*}/install_python.sh" "$lab/scripts/install_python.sh"
 printf '\n' | XDG_DATA_HOME="$lab/data" run >"$lab/guest-ssd-output" 2>&1
 grep -F "$lab/guest-ssd/env/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
 grep -Fx -- "$lab/guest-ssd" "$DISCOVERY_WALKS" >/dev/null
 bad grep -Fx -- "$lab/guest-ssd/file-mount" "$DISCOVERY_WALKS"
 bad grep -F "$lab/hidden-backing/env" "$DISCOVERY_VISITS"
 grep -F '"event":"no_updates"' "$lab/guest-ssd-output" >/dev/null
-echo 'PASS: guest SSD, hidden backing devices, and zero eligible directory mounts'
+echo 'PASS: ext4 HDD root 253:1, scoped HOME opt-in, default skip, nested and external exclusions, guest SSD and hidden backing'
 echo 'PASS: SSD/memory, HDD links and mounts, LVM, mixed RAID, bind aliases, unknown devices and copied-venv bases'
 
 # The same virtual disk has three mounts. A yes on the parent must not grant

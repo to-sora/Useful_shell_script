@@ -23,6 +23,12 @@ device ID and reason and asks `Scan ... for Python environments? [y/N]`.
 can execute candidate interpreters, so choose trusted mounts. EOF at any mount
 question cancels the run before discovery starts.
 
+If there are no automatic roots or uncertain mounts to offer and the device
+covering `$HOME` reports HDD, the updater offers the home directory itself.
+For example, `Scan /home/vmadmin for Python environments? [y/N]` authorizes
+only that directory on its current mount. Enter or `n` finishes without a scan.
+Links outside the home directory and nested mounts are excluded.
+
 Existing `opt/python-*/bin/python*` installations and venv configurations
 provide the evidence; neither an installation registry nor changes to
 `install_python.sh` are required. An installation created with `--no-bashrc` or
@@ -88,10 +94,11 @@ source installer expects Ubuntu.
 ### Storage-aware discovery
 
 Every scan/plan/apply inventories mounts with `findmnt` and inverse `lsblk`
-trees. Known HDDs (including members of mixed stacks), loop devices, network
-mounts, overlay and unsupported filesystem types are excluded. SSDs and memory
-filesystems are eligible. Explicit commands skip uncertain storage, including
-when `apply` uses `-Y`.
+trees. SSDs and memory filesystems are eligible for automatic discovery.
+Reported HDDs, including members of mixed stacks, are excluded from automatic
+scans. Loops, network mounts, overlay and unsupported filesystem types are
+excluded from all scan choices. Explicit commands skip HDDs and uncertain
+storage, including when `apply` uses `-Y`.
 
 Only the zero-argument workflow offers a scan choice for supported local
 filesystems with incomplete backing information, or an emulated disk reporting
@@ -102,7 +109,10 @@ Choices apply to the exact mount path: nested mounts and bind aliases are
 assessed separately, even on the same device. Declining every offered mount
 when no automatic root exists finishes the run before discovery.
 `storage.json` beside the process log preserves the reported class and reason
-and records each answer in `scan_choice`. A new run collects new choices.
+and records each answer in `scan_choice` with its path in `scan_scope`.
+The HDD home-directory prompt is offered only when no mounts qualified and no
+mount choices were offered. Its scope is the canonical home path and the mount
+that contains it. A new run collects new choices.
 If a new target must be built, its runtime cache also needs an eligible mount.
 Set `XDG_DATA_HOME` to a directory on an included mount for that run.
 

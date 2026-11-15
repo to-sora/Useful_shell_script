@@ -13,6 +13,7 @@ declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
 ASSUME_YES=0
 INTERACTIVE=0 BATCH_APPROVED=0 STORAGE_READY=0
+HOME_ONLY_MOUNT=''
 declare -a MOUNT_PATHS=() MOUNT_CLASSES=() MOUNT_QUESTIONS=() MOUNT_APPROVED=()
 declare -A STORAGE_WARNED=()
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater"
@@ -76,11 +77,12 @@ Usage:
 
 With no arguments, scan SSD/memory mounts and ask [y/N] for each uncertain local
 mount before discovery. Scan permission covers that mount for this run.
+If no mounts qualify and HOME is on a reported HDD, offer to scan HOME only.
 Review the resulting plan and press Enter to approve the updates.
 Original Python and venv base paths are required in this mode. No installer changes
 or installation registry are needed. Explicit commands retain their HOME default.
-Known HDDs, loops and unsupported filesystems are excluded. Explicit commands
-also exclude uncertain media, including virtual disks reporting rotation.
+HDDs are excluded from automatic scans. Loops and unsupported filesystems
+are excluded. Explicit commands skip HDDs and uncertain media.
 Plan/apply use the adjacent installer's release pins.
 Apply reuses healthy targets or builds missing branches, then updates environments.
 Plan reports required builds without installing. Installer --print-pins lists versions.
@@ -203,18 +205,18 @@ load_storage() {
     MOUNT_PATHS+=("$path")
     MOUNT_CLASSES+=("$class")
     MOUNT_QUESTIONS+=("$question")
-  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000",
-    (if .ask then "\(.filesystem), device \(.device), class \(.class): \(.reason)" else "" end),"\u0000"' "$WORK/storage.json")
+  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000",(.ask // false|tostring),"\u0000"' "$WORK/storage.json")
   STORAGE_READY=1
   cp -- "$WORK/storage.json" "$LOG_DIR/storage.json"
 }
 storage_class() {
   local path=$1 i
-  STORAGE_CLASS=unknown STORAGE_APPROVED=0
+  STORAGE_CLASS=unknown STORAGE_APPROVED=0 STORAGE_MOUNT_INDEX=''
   for i in "${!MOUNT_PATHS[@]}"; do
     if within "$path" "${MOUNT_PATHS[$i]}"; then
       STORAGE_CLASS=${MOUNT_CLASSES[$i]}
-      STORAGE_APPROVED=${MOUNT_APPROVED[$i]:-0}
+      STORAGE_MOUNT_INDEX=$i
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]] && within "$path" "${MOUNT_APPROVED[$i]}"; then STORAGE_APPROVED=1; fi
       break
     fi
   done
@@ -223,6 +225,10 @@ storage_allowed() {
   local path=$1
   ((STORAGE_READY)) || return 0
   storage_class "$path"
+  if [[ -n $HOME_ONLY_MOUNT ]]; then
+    [[ $STORAGE_MOUNT_INDEX == "$HOME_ONLY_MOUNT" && $STORAGE_APPROVED == 1 ]]
+    return
+  fi
   [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory || $STORAGE_APPROVED == 1 ]]
 }
 storage_warning() {
@@ -234,10 +240,11 @@ storage_warning() {
   event storage_skipped "$path" "$STORAGE_CLASS"
 }
 ask_scan_mount() {
-  local i=$1 path=${MOUNT_PATHS[$1]} answer choice
-  printf '\n%s (%s)\n' "$path" "${MOUNT_QUESTIONS[$i]}" >&2
+  local i=$1 mount=${MOUNT_PATHS[$1]} scope=$2 answer choice
+  jq -r --arg mount "$mount" 'first(.[]|select(.path==$mount)) |
+    "\(.path) (\(.filesystem), device \(.device), class \(.class): \(.reason))"' "$LOG_DIR/storage.json" >&2
   while true; do
-    printf 'Scan %s for Python environments? [y/N] ' "$path" >&2
+    printf 'Scan %s for Python environments? [y/N] ' "$scope" >&2
     if ! IFS= read -r answer; then
       printf '\n' >&2
       choice=input_ended
@@ -249,30 +256,30 @@ ask_scan_mount() {
       *) printf 'Enter y to scan or n to skip.\n' >&2 ;;
     esac
   done
-  json_edit "$LOG_DIR/storage.json" --arg path "$path" --arg choice "$choice" \
-    'map(if .path==$path then .scan_choice=$choice else . end)'
-  event storage_choice "$path" "$choice"
+  json_edit "$LOG_DIR/storage.json" --arg mount "$mount" --arg scope "$scope" --arg choice "$choice" \
+    'map(if .path==$mount then .+{scan_scope:$scope,scan_choice:$choice} else . end)'
+  event storage_choice "$scope" "$choice"
   case "$choice" in
-    approved) MOUNT_APPROVED[$i]=1 ;;
+    approved) MOUNT_APPROVED[$i]=$scope ;;
     input_ended) die "Storage selection ended before discovery. Storage inventory: $LOG_DIR/storage.json" ;;
   esac
 }
 automatic_roots() {
-  local path i asked=0
+  local path i home asked=0
   ROOTS=()
   for i in "${!MOUNT_PATHS[@]}"; do
     path=${MOUNT_PATHS[$i]}
     case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) continue ;; esac
     protected "$path" && continue
     if within "$path" "$RUNTIME_DIR" || within "$path" "$LOG_ROOT"; then continue; fi
-    if [[ -n ${MOUNT_QUESTIONS[$i]} ]]; then
+    if [[ ${MOUNT_QUESTIONS[$i]} == true ]]; then
       [[ -d $path ]] || continue
       if ((asked == 0)); then
         printf '\nSelect trusted mounts for discovery. Scanning runs candidate Python interpreters. Updates require a separate confirmation.\n' >&2
       fi
       asked=1
-      ask_scan_mount "$i"
-      if [[ ${MOUNT_APPROVED[$i]:-0} == 1 ]]; then ROOTS+=("$path"); fi
+      ask_scan_mount "$i" "$path"
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]]; then ROOTS+=("$path"); fi
     elif [[ ${MOUNT_CLASSES[$i]} == ssd || ${MOUNT_CLASSES[$i]} == memory ]]; then
       if [[ -d $path ]]; then ROOTS+=("$path"); fi
     fi
@@ -282,9 +289,26 @@ automatic_roots() {
       event no_scan '' 'All offered mounts were skipped'
       return 0
     fi
+    home="$(realpath -m -- "$HOME")"
+    storage_class "$home"
+    if [[ $STORAGE_CLASS == hdd && $home != / && -d $home ]] && walk_root_allowed "$home" &&
+      ! within "$home" "$RUNTIME_DIR" && ! within "$home" "$LOG_ROOT"; then
+      i=$STORAGE_MOUNT_INDEX
+      printf '\nNo automatic scan roots. The home mount reports rotational media.\n' >&2
+      printf 'Only %s on this mount is offered. Scanning runs candidate Python interpreters. Updates require a separate confirmation.\n' "$home" >&2
+      printf 'Storage inventory: %s/storage.json\n' "$LOG_DIR" >&2
+      ask_scan_mount "$i" "$home"
+      if [[ -n ${MOUNT_APPROVED[$i]:-} ]]; then
+        HOME_ONLY_MOUNT=$i
+        ROOTS+=("$home")
+      else
+        event no_scan "$home" 'Home scan skipped'
+      fi
+      return 0
+    fi
     # storage.json is ordered by descending mount path length. Use the same
     # path boundary as storage_class, including when HOME is on the root mount.
-    jq -r --arg home "$(realpath -m -- "$HOME")" '
+    jq -r --arg home "$home" '
       first(.[] | .path as $mount | select($home==$mount or
         ($home|startswith(($mount|rtrimstr("/"))+"/")))) |
       "Home \($home): mount \(.path), filesystem \(.filesystem), device \(.device), class \(.class) (\(.reason))."
