@@ -150,7 +150,8 @@ within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
 load_storage() {
   local path class
   findmnt --json --list --output TARGET,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
-  if ! lsblk --json --inverse --output MAJ:MIN,ROTA,TYPE >"$WORK/block-devices.json" 2>"$WORK/lsblk-errors"; then
+  if ! lsblk --json --inverse --tree --output NAME,MAJ:MIN,ROTA,TYPE >"$WORK/block-devices.json"; then
+    printf 'Cannot read the block device tree; block-backed mounts will be classified as unknown.\n' >&2
     printf '{"blockdevices":[]}\n' >"$WORK/block-devices.json"
   fi
   jq -e '(.filesystems|type)=="array" and all(.filesystems[];
@@ -160,16 +161,23 @@ load_storage() {
     def backing: recurse(.children[]?);
     def disk_class:
       if any(backing; .rota==true or .rota==1 or .rota=="1") then "hdd"
-      elif any(backing; .type=="loop" or (.rota!=false and .rota!=0 and .rota!="0")) then "unknown"
+      elif any(backing; .type=="loop" or (.rota!=false and .rota!=0 and .rota!="0")
+               or ((.children|length)==0 and .type!="disk")) then "unknown"
       else "ssd" end;
+    def mount_class($disk):
+      if (.fstype=="tmpfs" or .fstype=="ramfs") then {class:"memory",reason:"memory filesystem"}
+      elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$")|not)
+        then {class:"unknown",reason:"filesystem type excluded from discovery"}
+      elif $disk=="hdd" then {class:"hdd",reason:"device stack reports rotational media"}
+      elif $disk=="ssd" then {class:"ssd",reason:"device stack reports non-rotational disks"}
+      elif $disk=="unknown" then {class:"unknown",reason:"loop device or incomplete backing disk or rotation information"}
+      else {class:"unknown",reason:"mount device ID absent from the block device tree"} end;
     [$devices[0].blockdevices[]? | backing | {device:.["maj:min"],class:disk_class}]
     | group_by(.device) | map({key:.[0].device,value:
         (if any(.[];.class=="hdd") then "hdd"
          elif any(.[];.class=="unknown") then "unknown" else "ssd" end)}) | from_entries as $disks
-    | [$mounts[0].filesystems[] | {path:.target, filesystem:.fstype,
-        class:(if (.fstype=="tmpfs" or .fstype=="ramfs") then "memory"
-          elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$"))
-          then ($disks[.["maj:min"]] // "unknown") else "unknown" end)}]
+    | [$mounts[0].filesystems[] | (.["maj:min"] // "") as $id |
+        {path:.target, filesystem:.fstype, device:$id} + mount_class($disks[$id])]
     | sort_by(.path|length) | reverse' >"$WORK/storage.json" || die 'Invalid storage inventory'
   MOUNT_PATHS=() MOUNT_CLASSES=()
   while IFS= read -r -d '' path && IFS= read -r -d '' class; do
@@ -211,9 +219,22 @@ automatic_roots() {
     case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) continue ;; esac
     protected "$path" && continue
     if within "$path" "$RUNTIME_DIR" || within "$path" "$LOG_ROOT"; then continue; fi
-    case "${MOUNT_CLASSES[$i]}" in ssd | memory) ROOTS+=("$path") ;; esac
+    case "${MOUNT_CLASSES[$i]}" in
+      ssd | memory)
+        if [[ -d $path ]]; then ROOTS+=("$path"); fi
+        ;;
+    esac
   done
-  ((${#ROOTS[@]})) || die 'No SSD or memory filesystems available for discovery; see storage.json'
+  if ((${#ROOTS[@]} == 0)); then
+    # storage.json is ordered by descending mount path length. Use the same
+    # path boundary as storage_class, including when HOME is on the root mount.
+    jq -r --arg home "$(realpath -m -- "$HOME")" '
+      first(.[] | .path as $mount | select($home==$mount or
+        ($home|startswith(($mount|rtrimstr("/"))+"/")))) |
+      "Home \($home): mount \(.path), filesystem \(.filesystem), device \(.device), class \(.class) (\(.reason))."
+    ' "$LOG_DIR/storage.json" >&2
+    die "No eligible SSD or memory directory mounts for discovery. Storage inventory: $LOG_DIR/storage.json"
+  fi
 }
 assert_control_paths() {
   local prefixes=$1 path resolved prefix
@@ -378,6 +399,7 @@ scan() {
     for mount in "$root" "${MOUNT_PATHS[@]}"; do
       within "$mount" "$root" && storage_allowed "$mount" || continue
       walk_root_allowed "$mount" || continue
+      [[ $mount == "$root" || -d $mount ]] || continue
       [[ ! ${walk_seen[$mount]+yes} ]] || continue
       walk_seen[$mount]=1
     done

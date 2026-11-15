@@ -90,6 +90,22 @@ storage whose physical disks are hidden. Classification reflects the information
 reported by the operating system, including virtual disks' reported ROTA values.
 `storage.json` beside the process log records every mount and its classification.
 
+If zero-argument discovery exits with no eligible directory mounts, read
+`storage.json` from the run directory printed beside `Log:`. The diagnostic prints
+the absolute inventory path and the mount, device ID and classification covering
+`$HOME`. The `Output:` journal path is prospective at this stage. This exit
+precedes the environment scan, target builds and journal creation.
+
+On a VM, `hdd` means that the guest reports rotational media in the device
+stack. For SSD-backed guest storage, expose the SSD characteristic through the
+virtual disk configuration supported by the hypervisor. `unknown` includes an
+unsupported filesystem or incomplete device information; each inventory entry
+records its reason, and `process.log` includes any error from `lsblk`. Use
+`findmnt -T "$HOME" -o TARGET,SOURCE,FSTYPE,MAJ:MIN` and
+`lsblk --inverse --tree -o NAME,MAJ:MIN,ROTA,TYPE` to view the guest mapping.
+The same media rules apply to explicit roots. System tmpfs under `/run` or
+`/dev` and individual file mounts do not provide automatic discovery roots.
+
 Each physical walk uses `-xdev` and prunes nested mountpoints, including bind
 mounts. Eligible nested SSD mounts receive their own walk. HDD mounts and
 directory/interpreter links resolving to HDD receive no recursive search or

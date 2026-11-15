@@ -13,7 +13,7 @@ mkdir -p "$lab/tools" "$lab/scripts" "$lab/ssd/hdd" "$lab/ssd/unknown" "$lab/ssd
 cp -- "$updater" "$lab/scripts/update_python_envs.sh"
 export DISCOVERY_MOUNTS="$lab/mounts.json" DISCOVERY_DISKS="$lab/disks.json"
 export DISCOVERY_PROBES="$lab/probes" DISCOVERY_TIMEOUT
-export DISCOVERY_FIND DISCOVERY_VISITS="$lab/visits"
+export DISCOVERY_FIND DISCOVERY_VISITS="$lab/visits" DISCOVERY_WALKS="$lab/walks"
 DISCOVERY_TIMEOUT=$(command -v timeout)
 DISCOVERY_FIND=$(command -v find)
 cat >"$lab/tools/findmnt" <<'TOOL'
@@ -22,7 +22,12 @@ cat "$DISCOVERY_MOUNTS"
 TOOL
 cat >"$lab/tools/lsblk" <<'TOOL'
 #!/usr/bin/env bash
-cat "$DISCOVERY_DISKS"
+# Match lsblk's JSON contract: flat output drops the backing-device relationships.
+case " $* " in *" --inverse "*) ;; *) exit 2 ;; esac
+case " $* " in
+  *" --tree "* | *" NAME,"*) cat "$DISCOVERY_DISKS" ;;
+  *) jq '{blockdevices:[.blockdevices[] | recurse(.children[]?) | del(.children)]}' "$DISCOVERY_DISKS" ;;
+esac
 TOOL
 cat >"$lab/tools/timeout" <<'TOOL'
 #!/usr/bin/env bash
@@ -33,6 +38,7 @@ cat >"$lab/tools/find" <<'TOOL'
 #!/usr/bin/env bash
 if [[ ${1:-} == -P && ${3:-} == -xdev ]]; then
   root=$2
+  printf '%s\n' "$root" >>"$DISCOVERY_WALKS"
   shift 3
   "$DISCOVERY_FIND" -P "$root" -xdev -fprintf "$DISCOVERY_VISITS.$$" '%p\n' '(' "$@" ')'
   status=$?
@@ -49,7 +55,9 @@ cat >"$DISCOVERY_DISKS" <<'JSON'
  {"maj:min":"8:17","rota":true,"type":"part","children":[{"maj:min":"8:16","rota":true,"type":"disk"}]},
  {"maj:min":"253:0","rota":false,"type":"lvm","children":[{"maj:min":"8:17","rota":true,"type":"part"}]},
  {"maj:min":"9:0","rota":false,"type":"raid1","children":[{"maj:min":"8:0","rota":false,"type":"disk"},{"maj:min":"8:16","rota":true,"type":"disk"}]},
- {"maj:min":"7:0","rota":false,"type":"loop"}
+ {"maj:min":"7:0","rota":false,"type":"loop"},
+ {"maj:min":"253:1","rota":false,"type":"lvm","children":[{"maj:min":"252:1","rota":false,"type":"part","children":[{"maj:min":"252:0","rota":false,"type":"disk"}]}]},
+ {"maj:min":"253:2","rota":false,"type":"lvm"}
 ]}
 JSON
 jq -n --arg p "$lab" '{filesystems:[
@@ -63,7 +71,10 @@ jq -n --arg p "$lab" '{filesystems:[
  {target:($p+"/ssd/raid"),fstype:"xfs","maj:min":"9:0"},
  {target:($p+"/ssd/loop"),fstype:"ext4","maj:min":"7:0"},
  {target:($p+"/ssd/unknown"),fstype:"nfs4","maj:min":"0:99"},
- {target:($p+"/memory"),fstype:"tmpfs","maj:min":"0:88"}
+ {target:($p+"/memory"),fstype:"tmpfs","maj:min":"0:88"},
+ {target:($p+"/guest-ssd"),fstype:"ext4","maj:min":"253:1"},
+ {target:($p+"/guest-ssd/file-mount"),fstype:"tmpfs","maj:min":"0:89"},
+ {target:($p+"/hidden-backing"),fstype:"ext4","maj:min":"253:2"}
 ]}' >"$DISCOVERY_MOUNTS"
 run() { PATH="$lab/tools:$PATH" bash "$lab/scripts/update_python_envs.sh" "$@"; }
 bad() { if "$@"; then
@@ -76,7 +87,8 @@ canary() {
   : >"$1/pyvenv.cfg"
   cp /bin/true "$1/bin/python"
 }
-for path in ssd/local ssd/hdd/env hdd/env alias-hdd/env ssd/unknown/env ssd/raid/env ssd/loop/env hdd/ssd/local memory/local; do canary "$lab/$path"; done
+for path in ssd/local ssd/hdd/env hdd/env alias-hdd/env ssd/unknown/env ssd/raid/env ssd/loop/env hdd/ssd/local memory/local guest-ssd/env hidden-backing/env; do canary "$lab/$path"; done
+touch "$lab/guest-ssd/file-mount"
 canary "$lab/ssd/disk [hdd]*?\\volume/env"
 ln -s "$lab/hdd/env" "$lab/ssd/hdd-link"
 ln -s "$lab/hdd/env/bin/python" "$lab/ssd/local/bin/python999"
@@ -95,7 +107,10 @@ storage=$(sed -n 's/^Log: //p' "$lab/scan-output")
 storage=${storage%/*}/storage.json
 jq -e --arg p "$lab" '
   any(.[];.path==($p+"/ssd") and .class=="ssd") and
-  all(.[]|select(.path==($p+"/ssd/hdd") or .path==($p+"/ssd/raid") or .path==($p+"/alias-hdd"));.class=="hdd") and
+  any(.[];.path==($p+"/ssd/raid") and .class=="hdd") and
+  any(.[];.path==($p+"/guest-ssd") and .class=="ssd" and .device=="253:1") and
+  any(.[];.path==($p+"/hidden-backing") and .class=="unknown") and
+  all(.[]|select(.path==($p+"/ssd/hdd") or .path==($p+"/alias-hdd"));.class=="hdd") and
   all(.[]|select(.path==($p+"/ssd/loop") or .path==($p+"/ssd/unknown"));.class=="unknown")' "$storage" >/dev/null
 jq -e 'any(.warnings[];.reason=="Storage excluded: hdd")' "$lab/scan.json" >/dev/null
 : >"$DISCOVERY_PROBES"
@@ -105,11 +120,56 @@ jq -e '.environments==[] and any(.warnings[];.reason=="Storage excluded: hdd")' 
 
 # Unknown device information is fail-closed, including a failed lsblk query.
 cp "$lab/tools/lsblk" "$lab/lsblk.original"
-printf '#!/usr/bin/env bash\nexit 1\n' >"$lab/tools/lsblk"
+printf '#!/usr/bin/env bash\necho "lsblk: test sysfs unavailable" >&2\nexit 1\n' >"$lab/tools/lsblk"
 run scan "$lab/ssd" --output "$lab/unknown.json" >"$lab/unknown-output" 2>&1
 [[ ! -s $DISCOVERY_PROBES ]]
 jq -e '.environments==[] and any(.warnings[];.reason=="Storage excluded: unknown")' "$lab/unknown.json" >/dev/null
+grep -F 'lsblk: test sysfs unavailable' "$(sed -n 's/^Log: //p' "$lab/unknown-output")" >/dev/null
 cp "$lab/lsblk.original" "$lab/tools/lsblk"
+
+# An Ubuntu guest may have only a rotational root, system tmpfs directories
+# and file bind mounts. No directory walk, build, or journal should start.
+cp "$DISCOVERY_MOUNTS" "$lab/eligible-mounts.json"
+touch "$lab/file-mount"
+jq -n --arg file "$lab/file-mount" '{filesystems:[
+ {target:"/",fstype:"ext4","maj:min":"8:17"},
+ {target:"/dev/shm",fstype:"tmpfs","maj:min":"0:11"},
+ {target:"/run",fstype:"tmpfs","maj:min":"0:12"},
+ {target:$file,fstype:"tmpfs","maj:min":"0:13"}
+]}' >"$DISCOVERY_MOUNTS"
+: >"$DISCOVERY_VISITS"
+status=0
+XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/no-roots-output" 2>&1 || status=$?
+[[ $status == 2 && ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES ]]
+journal=$(output_path "$lab/no-roots-output")
+[[ -n $journal && ! -e $journal ]]
+storage=${journal%/*}/storage.json
+grep -F "Storage inventory: $storage" "$lab/no-roots-output" >/dev/null
+grep -F 'mount /, filesystem ext4, device 8:17, class hdd' "$lab/no-roots-output" >/dev/null
+jq -e 'any(.[];.path=="/" and .class=="hdd" and .device=="8:17")' "$storage" >/dev/null
+bad grep -E '"event":"(scan_started|target_build_started|prepare)"' "$lab/no-roots-output"
+
+# HOME can be a separate mount whose device is hidden from the guest.
+home_path=$(realpath -m -- "$HOME")
+jq --arg path "$home_path" '.filesystems += [{target:$path,fstype:"ext4","maj:min":"252:99"}]' \
+  "$DISCOVERY_MOUNTS" >"$lab/separate-home.json"
+mv "$lab/separate-home.json" "$DISCOVERY_MOUNTS"
+status=0
+XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/hidden-home-output" 2>&1 || status=$?
+[[ $status == 2 && ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES ]]
+grep -F "mount $home_path, filesystem ext4, device 252:99, class unknown" "$lab/hidden-home-output" >/dev/null
+grep -F 'mount device ID absent from the block device tree' "$lab/hidden-home-output" >/dev/null
+mv "$lab/eligible-mounts.json" "$DISCOVERY_MOUNTS"
+
+# The normal zero-argument entry point must reach discovery on a guest SSD.
+cp -- "${updater%/*}/install_python.sh" "$lab/scripts/install_python.sh"
+XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/guest-ssd-output" 2>&1
+grep -F "$lab/guest-ssd/env/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
+grep -Fx -- "$lab/guest-ssd" "$DISCOVERY_WALKS" >/dev/null
+bad grep -Fx -- "$lab/guest-ssd/file-mount" "$DISCOVERY_WALKS"
+bad grep -F "$lab/hidden-backing/env" "$DISCOVERY_VISITS"
+grep -F '"event":"no_updates"' "$lab/guest-ssd-output" >/dev/null
+echo 'PASS: guest SSD, hidden backing devices, and zero eligible directory mounts'
 echo 'PASS: SSD/memory, HDD links and mounts, LVM, mixed RAID, bind aliases, unknown devices and copied-venv bases'
 (($# == 2)) || exit 0
 
