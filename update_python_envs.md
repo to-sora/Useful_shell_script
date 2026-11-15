@@ -15,14 +15,20 @@ Stop applications using the selected environments, then run as their owner:
 bash update_python_envs.sh
 ```
 
-With no arguments, the updater discovers account-owned private installations and
-venvs on mounted SSD and memory filesystems, including installations outside
-`$HOME`. Existing `opt/python-*/bin/python*` installations and venv configurations
+With no arguments, the updater scans SSD and memory mounts for account-owned
+installations and venvs, including locations outside `$HOME`. For a supported
+local filesystem with uncertain backing media, it displays the mount path,
+device ID and reason and asks `Scan ... for Python environments? [y/N]`.
+`y` or `yes` includes that mount in this run. Enter or `n` skips it. Discovery
+can execute candidate interpreters, so choose trusted mounts. EOF at any mount
+question cancels the run before discovery starts.
+
+Existing `opt/python-*/bin/python*` installations and venv configurations
 provide the evidence; neither an installation registry nor changes to
 `install_python.sh` are required. An installation created with `--no-bashrc` or
 absent from PATH can be discovered by its files.
 
-The updater displays original paths, versions, planned actions and skip reasons.
+After discovery, the updater displays original paths, versions, planned actions and skip reasons.
 Press **Enter** (or `y`/`Y`) to approve the batch. Other answers cancel. EOF and
 Ctrl+C abort. Confirmation precedes target builds and environment changes; builds
 and checks receive EOF on stdin. Target preparation, backups, validation and
@@ -81,14 +87,24 @@ source installer expects Ubuntu.
 
 ### Storage-aware discovery
 
-Every scan/plan/apply inventories mounts with `findmnt` and backing devices with
-inverse `lsblk` trees. A rotational disk anywhere in a partition/LVM/RAID stack
-excludes that mount. SSD and tmpfs/ramfs mounts are eligible. Unknown media,
-loop devices, network filesystems, overlay filesystems and unsupported filesystem
-types are excluded rather than treated as SSD. This can exclude virtual/container
-storage whose physical disks are hidden. Classification reflects the information
-reported by the operating system, including virtual disks' reported ROTA values.
-`storage.json` beside the process log records every mount and its classification.
+Every scan/plan/apply inventories mounts with `findmnt` and inverse `lsblk`
+trees. Known HDDs (including members of mixed stacks), loop devices, network
+mounts, overlay and unsupported filesystem types are excluded. SSDs and memory
+filesystems are eligible. Explicit commands skip uncertain storage, including
+when `apply` uses `-Y`.
+
+Only the zero-argument workflow offers a scan choice for supported local
+filesystems with incomplete backing information, or an emulated disk reporting
+rotation. Virtual disk names and model/vendor information identify emulation.
+When available, `systemd-detect-virt --vm` also identifies guests whose disk
+identity is hidden. A reported physical HDD in the chain takes precedence.
+Choices apply to the exact mount path: nested mounts and bind aliases are
+assessed separately, even on the same device. Declining every offered mount
+when no automatic root exists finishes the run before discovery.
+`storage.json` beside the process log preserves the reported class and reason
+and records each answer in `scan_choice`. A new run collects new choices.
+If a new target must be built, its runtime cache also needs an eligible mount.
+Set `XDG_DATA_HOME` to a directory on an included mount for that run.
 
 If zero-argument discovery exits with no eligible directory mounts, read
 `storage.json` from the run directory printed beside `Log:`. The diagnostic prints
@@ -96,21 +112,19 @@ the absolute inventory path and the mount, device ID and classification covering
 `$HOME`. The `Output:` journal path is prospective at this stage. This exit
 precedes the environment scan, target builds and journal creation.
 
-On a VM, `hdd` means that the guest reports rotational media in the device
-stack. For SSD-backed guest storage, expose the SSD characteristic through the
-virtual disk configuration supported by the hypervisor. `unknown` includes an
-unsupported filesystem or incomplete device information; each inventory entry
+On a VM, `hdd` records rotation as reported by the guest. The interactive scan
+question handles emulated disks whose host media the guest cannot identify.
+`unknown` includes unsupported filesystems or incomplete device information; each inventory entry
 records its reason, and `process.log` includes any error from `lsblk`. Use
 `findmnt -T "$HOME" -o TARGET,SOURCE,FSTYPE,MAJ:MIN` and
-`lsblk --inverse --tree -o NAME,MAJ:MIN,ROTA,TYPE` to view the guest mapping.
-The same media rules apply to explicit roots. System tmpfs under `/run` or
+`lsblk --inverse --tree -o NAME,MAJ:MIN,ROTA,TYPE,VENDOR,MODEL,TRAN` to view the guest mapping.
+System tmpfs under `/run` or
 `/dev` and individual file mounts do not provide automatic discovery roots.
 
 Each physical walk uses `-xdev` and prunes nested mountpoints, including bind
-mounts. Eligible nested SSD mounts receive their own walk. HDD mounts and
-directory/interpreter links resolving to HDD receive no recursive search or
-interpreter probe. Venv config and library/base paths are checked before probing
-copied interpreters. These exclusions apply to explicit search roots as well.
+mounts. Eligible nested mounts receive their own walk. Excluded and declined
+mounts are pruned. Directory links, interpreter links, venv config and library/base
+paths use the same mount decisions before interpreter probes.
 The inventory records storage skip reasons; inaccessible directories are recorded
 as discovery warnings. The report covers reachable, permitted storage, not
 unmounted or inaccessible environments.
@@ -333,6 +347,16 @@ coreutils and Bash.
 
 ## Validation
 
+### November 15 interactive scan choices
+
+The interactive storage tests exercise default skips, explicit yes/no answers,
+VM rotation reports, incomplete device information, and EOF between mount
+choices. They record directory walks and interpreter probes to verify that
+declining a nested mount or a bind alias excludes it even when its parent or
+another mount on the same device is approved. Explicit commands keep their
+storage exclusions. With private interpreter fixtures the test also accepts a
+scan, then cancels or closes the separate update prompt before any build.
+
 ### November 12 interactive and storage revision
 
 The complete updater suite passed with private CPython 3.8.19 and 3.8.20 builds,
@@ -343,7 +367,7 @@ parent revision byte for byte.
 
 The test container hides its backing disks and its `/tmp` lacks ACL support.
 The full suite therefore used an ACL-capable workspace with a test-only mount
-classification fixture; the shipped unknown-storage exclusion was unchanged.
+classification fixture. That revision excluded unknown storage.
 Dedicated fixtures test HDD/SSD/LVM/RAID classifications and record the paths
 visited by real `find` commands. Target preparation uses the existing installer
 fixture with real CPython binaries; Ubuntu apt and installer source builds were

@@ -18,6 +18,7 @@ DISCOVERY_TIMEOUT=$(command -v timeout)
 DISCOVERY_FIND=$(command -v find)
 cat >"$lab/tools/findmnt" <<'TOOL'
 #!/usr/bin/env bash
+case " $* " in *" --uniq "*) ;; *) exit 2 ;; esac
 cat "$DISCOVERY_MOUNTS"
 TOOL
 cat >"$lab/tools/lsblk" <<'TOOL'
@@ -28,6 +29,10 @@ case " $* " in
   *" --tree "* | *" NAME,"*) cat "$DISCOVERY_DISKS" ;;
   *) jq '{blockdevices:[.blockdevices[] | recurse(.children[]?) | del(.children)]}' "$DISCOVERY_DISKS" ;;
 esac
+TOOL
+cat >"$lab/tools/systemd-detect-virt" <<'TOOL'
+#!/usr/bin/env bash
+[[ $* == '--vm --quiet' && ${DISCOVERY_TEST_VM:-0} == 1 ]]
 TOOL
 cat >"$lab/tools/timeout" <<'TOOL'
 #!/usr/bin/env bash
@@ -127,7 +132,7 @@ jq -e '.environments==[] and any(.warnings[];.reason=="Storage excluded: unknown
 grep -F 'lsblk: test sysfs unavailable' "$(sed -n 's/^Log: //p' "$lab/unknown-output")" >/dev/null
 cp "$lab/lsblk.original" "$lab/tools/lsblk"
 
-# An Ubuntu guest may have only a rotational root, system tmpfs directories
+# A machine may have only a physical HDD root, system tmpfs directories
 # and file bind mounts. No directory walk, build, or journal should start.
 cp "$DISCOVERY_MOUNTS" "$lab/eligible-mounts.json"
 touch "$lab/file-mount"
@@ -157,13 +162,20 @@ mv "$lab/separate-home.json" "$DISCOVERY_MOUNTS"
 status=0
 XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/hidden-home-output" 2>&1 || status=$?
 [[ $status == 2 && ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES ]]
-grep -F "mount $home_path, filesystem ext4, device 252:99, class unknown" "$lab/hidden-home-output" >/dev/null
+grep -F "Scan $home_path for Python environments? [y/N]" "$lab/hidden-home-output" >/dev/null
 grep -F 'mount device ID absent from the block device tree' "$lab/hidden-home-output" >/dev/null
+grep -F 'Storage selection ended before discovery' "$lab/hidden-home-output" >/dev/null
+journal=$(output_path "$lab/hidden-home-output")
+[[ ! -e $journal ]]
+jq -e --arg home "$home_path" 'any(.[];.path==$home and .class=="unknown" and .scan_choice=="input_ended")' "${journal%/*}/storage.json" >/dev/null
+printf '\n' | XDG_DATA_HOME="$lab/data" run >"$lab/skip-home-output" 2>&1
+grep -F '"event":"no_scan"' "$lab/skip-home-output" >/dev/null
+[[ ! -s $DISCOVERY_VISITS && ! -s $DISCOVERY_PROBES && ! -e $(output_path "$lab/skip-home-output") ]]
 mv "$lab/eligible-mounts.json" "$DISCOVERY_MOUNTS"
 
 # The normal zero-argument entry point must reach discovery on a guest SSD.
 cp -- "${updater%/*}/install_python.sh" "$lab/scripts/install_python.sh"
-XDG_DATA_HOME="$lab/data" run </dev/null >"$lab/guest-ssd-output" 2>&1
+printf '\n' | XDG_DATA_HOME="$lab/data" run >"$lab/guest-ssd-output" 2>&1
 grep -F "$lab/guest-ssd/env/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
 grep -Fx -- "$lab/guest-ssd" "$DISCOVERY_WALKS" >/dev/null
 bad grep -Fx -- "$lab/guest-ssd/file-mount" "$DISCOVERY_WALKS"
@@ -171,6 +183,103 @@ bad grep -F "$lab/hidden-backing/env" "$DISCOVERY_VISITS"
 grep -F '"event":"no_updates"' "$lab/guest-ssd-output" >/dev/null
 echo 'PASS: guest SSD, hidden backing devices, and zero eligible directory mounts'
 echo 'PASS: SSD/memory, HDD links and mounts, LVM, mixed RAID, bind aliases, unknown devices and copied-venv bases'
+
+# The same virtual disk has three mounts. A yes on the parent must not grant
+# access to its nested mount or another alias. The ordinary SSD does not
+# start discovery until every choice has been answered.
+cp "$DISCOVERY_MOUNTS" "$lab/normal-mounts.json"
+cp "$DISCOVERY_DISKS" "$lab/normal-disks.json"
+for path in ask/env ask/nested/env other-alias-long/env real-hdd/env mixed-raid/env loop-hidden/env loop-source/env network/env; do
+  canary "$lab/$path"
+done
+ln -s "$lab/ask/nested/env/bin/python" "$lab/ask/env/bin/python777"
+jq '.blockdevices += [
+  {"maj:min":"252:0",name:"sda",type:"disk",rota:true,vendor:"QEMU",model:"QEMU HARDDISK",tran:"scsi"},
+  {"maj:min":"8:32",name:"sdc",type:"disk",rota:true,vendor:"ATA",model:"ST1000",tran:"sata"},
+  {"maj:min":"9:3",name:"md3",type:"raid1",rota:false,children:[
+    {"maj:min":"252:0",name:"sda",type:"disk",rota:true,model:"QEMU HARDDISK"},
+    {"maj:min":"8:32",name:"sdc",type:"disk",rota:true,vendor:"ATA",model:"ST1000",tran:"sata"}]}
+]' "$lab/normal-disks.json" >"$DISCOVERY_DISKS"
+jq -n --arg p "$lab" '{filesystems:[
+  {target:"/",fstype:"overlay","maj:min":"0:1"},
+  {target:($p+"/ask"),fstype:"ext4","maj:min":"252:0"},
+  {target:($p+"/ask/nested"),fstype:"ext4","maj:min":"252:0"},
+  {target:($p+"/other-alias-long"),fstype:"xfs","maj:min":"252:0"},
+  {target:($p+"/guest-ssd"),fstype:"ext4","maj:min":"8:1"},
+  {target:($p+"/real-hdd"),fstype:"ext4","maj:min":"8:32"},
+  {target:($p+"/mixed-raid"),fstype:"xfs","maj:min":"9:3"},
+  {target:($p+"/loop-hidden"),fstype:"ext4","maj:min":"7:29"},
+  {target:($p+"/loop-source"),source:"/dev/loop29[/dir]",fstype:"ext4","maj:min":"0:70"},
+  {target:($p+"/network"),fstype:"nfs4","maj:min":"0:77"},
+  {target:($p+"/file-mount"),fstype:"ext4","maj:min":"0:71"},
+  {target:"/run",fstype:"ext4","maj:min":"0:72"}
+]}' >"$DISCOVERY_MOUNTS"
+export DISCOVERY_TEST_VM=1
+: >"$DISCOVERY_PROBES"
+: >"$DISCOVERY_WALKS"
+: >"$DISCOVERY_VISITS"
+status=0
+printf 'y\n' | XDG_DATA_HOME="$lab/data" run >"$lab/partial-output" 2>&1 || status=$?
+journal=$(output_path "$lab/partial-output")
+[[ $status == 2 && -n $journal && ! -e $journal && ! -s $DISCOVERY_WALKS && ! -s $DISCOVERY_PROBES ]]
+bad grep -E '"event":"(scan_started|target_build_started|prepare)"' "$lab/partial-output"
+jq -e 'any(.[];.scan_choice=="approved") and any(.[];.scan_choice=="input_ended")' "${journal%/*}/storage.json" >/dev/null
+
+mkdir -p "$lab/ask/nested/cache/python-env-updater"
+printf 'cache on a skipped mount\n' >"$lab/ask/nested/cache/python-env-updater/targets.json"
+printf 'no\nN\ninvalid\nYES\n' | XDG_DATA_HOME="$lab/ask/nested/cache" run >"$lab/choices-output" 2>&1
+journal=$(output_path "$lab/choices-output")
+grep -F 'Enter y to scan or n to skip.' "$lab/choices-output" >/dev/null
+grep -F "$lab/ask/env/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
+grep -Fx -- "$lab/guest-ssd" "$DISCOVERY_WALKS" >/dev/null
+bad grep -E '/(nested|other-alias-long|real-hdd|mixed-raid|loop-hidden|loop-source|network)/|python777' "$DISCOVERY_PROBES"
+bad grep -E '/(nested|other-alias-long|real-hdd|mixed-raid|loop-hidden|loop-source|network)/env' "$DISCOVERY_VISITS"
+jq -e --arg p "$lab" '
+  any(.[];.path==($p+"/ask") and .class=="hdd" and .ask and .scan_choice=="approved") and
+  any(.[];.path==($p+"/ask/nested") and .scan_choice=="skipped") and
+  any(.[];.path==($p+"/other-alias-long") and .scan_choice=="skipped") and
+  ([.[]|select(has("scan_choice"))]|length)==3 and
+  all(.[]|select(.path==($p+"/real-hdd") or .path==($p+"/mixed-raid"));.class=="hdd" and (.ask|not)) and
+  all(.[]|select(.path==($p+"/loop-hidden") or .path==($p+"/loop-source"));.reason=="loop-backed mount" and (.ask|not))
+' "${journal%/*}/storage.json" >/dev/null
+
+# Accept a supported local directory whose device is invisible to lsblk.
+jq --arg p "$lab/ask" '{filesystems:[.filesystems[]|select(.target=="/" or .target==$p)]}
+  | (.filesystems[]|select(.target==$p))["maj:min"]="252:99"' "$DISCOVERY_MOUNTS" >"$lab/hidden.json"
+mv "$lab/hidden.json" "$DISCOVERY_MOUNTS"
+: >"$DISCOVERY_PROBES"
+printf 'Y\n' | XDG_DATA_HOME="$lab/data" run >"$lab/hidden-yes-output" 2>&1
+journal=$(output_path "$lab/hidden-yes-output")
+jq -e --arg p "$lab/ask" 'any(.[];.path==$p and .class=="unknown" and .scan_choice=="approved")' "${journal%/*}/storage.json" >/dev/null
+grep -F "$lab/ask/env/bin/python -I" "$DISCOVERY_PROBES" >/dev/null
+
+: >"$DISCOVERY_PROBES"
+: >"$DISCOVERY_WALKS"
+for command in scan plan apply; do
+  args=("$command" "$lab/ask")
+  if [[ $command == apply ]]; then args=(-Y "${args[@]}" --no-sudo); fi
+  XDG_DATA_HOME="$lab/data" run "${args[@]}" </dev/null >"$lab/explicit-$command-output" 2>&1
+  bad grep -F 'for Python environments? [y/N]' "$lab/explicit-$command-output"
+done
+[[ ! -s $DISCOVERY_PROBES && ! -s $DISCOVERY_WALKS ]]
+jq -e '.environments==[]' "$(output_path "$lab/explicit-scan-output")" >/dev/null
+jq -e '.plan==[]' "$(output_path "$lab/explicit-plan-output")" >/dev/null
+jq -e '.entries==[] and .failures==0' "$(output_path "$lab/explicit-apply-output")" >/dev/null
+# A transport label does not establish physical backing for a guest disk.
+jq '(.blockdevices[]|select(.["maj:min"]=="8:17")|.children[0]) += {name:"sdb",vendor:"",model:"",tran:"sata"}
+  | .blockdevices += [{"maj:min":"8:48",name:"sdd",type:"disk",rota:true,vendor:"Google",model:"PersistentDisk",tran:"scsi"}]' "$DISCOVERY_DISKS" >"$lab/cloud-disks.json"
+mv "$lab/cloud-disks.json" "$DISCOVERY_DISKS"
+jq --arg p "$lab/ask" '(.filesystems[]|select(.target==$p))["maj:min"]="8:17"' "$DISCOVERY_MOUNTS" >"$lab/unidentified.json"
+jq --arg p "$lab/other-alias-long" '.filesystems += [{target:$p,fstype:"ext4","maj:min":"8:48"}]' "$lab/unidentified.json" >"$DISCOVERY_MOUNTS"
+printf '\n\n' | XDG_DATA_HOME="$lab/data" run >"$lab/vm-identity-output" 2>&1
+journal=$(output_path "$lab/vm-identity-output")
+jq -e '([.[]|select(.class=="hdd" and .scan_choice=="skipped")]|length)==2' "${journal%/*}/storage.json" >/dev/null
+[[ ! -e $journal && ! -s $DISCOVERY_WALKS ]]
+echo 'PASS: mount-specific yes/no/default, incomplete inputs, hard exclusions and explicit commands'
+unset DISCOVERY_TEST_VM
+mv "$lab/normal-disks.json" "$DISCOVERY_DISKS"
+# The remaining Enter-only scenarios exercise automatic, known media.
+jq --arg hidden "$lab/hidden-backing" '.filesystems |= map(select(.target!=$hidden))' "$lab/normal-mounts.json" >"$DISCOVERY_MOUNTS"
 (($# == 2)) || exit 0
 
 old=$(realpath -e -- "$1")
@@ -218,6 +327,25 @@ for place in ssd/install hdd/ssd/old-install; do
   "$binary" -I -m venv --copies --without-pip "$base/env with spaces"
 done
 sha256sum "$DISCOVERY_INSTALLER" >"$lab/installer-hash"
+# Agreeing to scan an unknown mount does not approve its updates.
+cp "$DISCOVERY_MOUNTS" "$lab/known-only.json"
+jq --arg path "$lab/ssd" '(.filesystems[]|select(.target==$path))["maj:min"]="252:99"' "$lab/known-only.json" >"$DISCOVERY_MOUNTS"
+printf 'y\nn\n' | run >"$lab/ask-then-cancel-output" 2>&1
+journal=$(output_path "$lab/ask-then-cancel-output")
+jq -e --arg path "$lab/ssd" 'any(.[];.path==$path and .scan_choice=="approved")' "${journal%/*}/storage.json" >/dev/null
+jq -e --arg prefix "$lab/ssd/install/env with spaces" 'any(.plan[];.prefix==$prefix and (.action=="prepare_target" or .action=="update"))' "${journal%/*}/plan.json" >/dev/null
+grep -F '"event":"cancelled"' "$lab/ask-then-cancel-output" >/dev/null
+[[ ! -e $DISCOVERY_CALLS && ! -e $journal ]]
+[[ $("$lab/ssd/install/env with spaces/bin/python" -I --version) == "$old_version" ]]
+status=0
+printf 'y\n' | run >"$lab/ask-then-eof-output" 2>&1 || status=$?
+[[ $status == 2 && ! -e $DISCOVERY_CALLS && ! -e $(output_path "$lab/ask-then-eof-output") ]]
+grep -F 'Confirmation input ended' "$lab/ask-then-eof-output" >/dev/null
+mv "$lab/known-only.json" "$DISCOVERY_MOUNTS"
+status=0
+XDG_DATA_HOME="$lab/alias-hdd/cache" run </dev/null >"$lab/denied-cache-output" 2>&1 || status=$?
+[[ $status == 2 && ! -e $DISCOVERY_CALLS && ! -e $lab/alias-hdd/cache && ! -e $(output_path "$lab/denied-cache-output") ]]
+grep -F 'A target build needs an eligible cache mount' "$lab/denied-cache-output" >/dev/null
 bad run </dev/null >"$lab/eof-output" 2>&1
 grep -F 'Confirmation input ended' "$lab/eof-output" >/dev/null
 [[ ! -e $DISCOVERY_CALLS && ! -e $(output_path "$lab/eof-output") ]]

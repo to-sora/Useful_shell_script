@@ -13,7 +13,7 @@ declare -a INVOCATION=("$@")
 OUTPUT='' CHECKS='' COMMAND='' JOURNAL=''
 ASSUME_YES=0
 INTERACTIVE=0 BATCH_APPROVED=0 STORAGE_READY=0
-declare -a MOUNT_PATHS=() MOUNT_CLASSES=()
+declare -a MOUNT_PATHS=() MOUNT_CLASSES=() MOUNT_QUESTIONS=() MOUNT_APPROVED=()
 declare -A STORAGE_WARNED=()
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/python-env-updater"
 BUILD_JOBS=4
@@ -67,18 +67,20 @@ start_logging() {
 usage() {
   cat <<'HELP'
 Usage:
-  update_python_envs.sh                 # discover SSD installations, Enter to apply
+  update_python_envs.sh                 # choose uncertain mounts, discover, Enter to apply
   update_python_envs.sh scan [ROOT...]
   update_python_envs.sh plan [ROOT...]
   update_python_envs.sh [-Y] apply [ROOT...]
   update_python_envs.sh verify JOURNAL
   update_python_envs.sh rollback JOURNAL
 
-With no arguments, discover private installations on mounted SSD/memory filesystems,
-show the plan and ask for Enter before preparing targets or changing environments.
+With no arguments, scan SSD/memory mounts and ask [y/N] for each uncertain local
+mount before discovery. Scan permission covers that mount for this run.
+Review the resulting plan and press Enter to approve the updates.
 Original Python and venv base paths are required in this mode. No installer changes
 or installation registry are needed. Explicit commands retain their HOME default.
-HDD-backed and unknown storage (including link targets) is excluded from discovery.
+Known HDDs, loops and unsupported filesystems are excluded. Explicit commands
+also exclude uncertain media, including virtual disks reporting rotation.
 Plan/apply use the adjacent installer's release pins.
 Apply reuses healthy targets or builds missing branches, then updates environments.
 Plan reports required builds without installing. Installer --print-pins lists versions.
@@ -145,54 +147,74 @@ within() { [[ $1 == "$2" || $1 == "${2%/}/"* ]]; }
 # Read the mount table once. Walking each mount with -xdev and pruning every
 # nested mount prevents even a directory traversal into an HDD/bind mount.
 # Inverse lsblk trees include the backing devices of partitions, LVM and RAID.
-# A single rotational member excludes the complete stack. Unknown/loop/network
-# storage is excluded rather than assuming that a missing ROTA value means SSD.
+# A known HDD or loop excludes the complete stack. An emulated disk's rotation
+# flag describes the guest interface; the operator can decide whether to scan it.
 load_storage() {
-  local path class
-  findmnt --json --list --output TARGET,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
-  if ! lsblk --json --inverse --tree --output NAME,MAJ:MIN,ROTA,TYPE >"$WORK/block-devices.json"; then
+  local path class question vm=false
+  if command -v systemd-detect-virt >/dev/null && systemd-detect-virt --vm --quiet </dev/null 2>/dev/null; then vm=true; fi
+  findmnt --json --list --uniq --output TARGET,SOURCE,FSTYPE,MAJ:MIN >"$WORK/mounts.json" || die 'Cannot read mounted filesystems'
+  if ! lsblk --json --inverse --tree --output NAME,MAJ:MIN,ROTA,TYPE,VENDOR,MODEL >"$WORK/block-devices.json"; then
     printf 'Cannot read the block device tree; block-backed mounts will be classified as unknown.\n' >&2
     printf '{"blockdevices":[]}\n' >"$WORK/block-devices.json"
   fi
   jq -e '(.filesystems|type)=="array" and all(.filesystems[];
     (.target|type)=="string" and (.target|startswith("/")) and (.target|test("[\\t\\r\\n]")|not))' \
     "$WORK/mounts.json" >/dev/null || die 'Unsupported paths in mount inventory'
-  jq -n --slurpfile mounts "$WORK/mounts.json" --slurpfile devices "$WORK/block-devices.json" '
+  jq -n --argjson vm "$vm" --slurpfile mounts "$WORK/mounts.json" --slurpfile devices "$WORK/block-devices.json" '
     def backing: recurse(.children[]?);
+    def rotational: .rota==true or .rota==1 or .rota=="1";
+    def virtual_disk:
+      .type=="disk" and (
+        ((.name // "")|test("^(xvd|vd)[a-z]+$")) or
+        ([.vendor,.model]|join(" ")|test("QEMU|VMware|VBOX|VirtIO|Xen|Parallels|Virtual[ _-]*(Disk|HD)|Elastic Block Store|Persistent[ _-]*Disk";"i")) or
+        ($vm and ((.model // "")|test("^\\s*(unknown|generic|scsi disk|disk)?\\s*$";"i"))));
     def disk_class:
-      if any(backing; .rota==true or .rota==1 or .rota=="1") then "hdd"
-      elif any(backing; .type=="loop" or (.rota!=false and .rota!=0 and .rota!="0")
+      if any(backing; .type=="loop" or ((.["maj:min"] // "")|startswith("7:"))) then "loop"
+      elif any(backing; .type=="disk" and rotational and (virtual_disk|not)) then "hdd"
+      elif any(backing; rotational) then
+        if any(backing; virtual_disk) or ($vm and all(backing; .type!="disk"))
+        then "virtual-hdd" else "hdd" end
+      elif any(backing; (.rota!=false and .rota!=0 and .rota!="0")
                or ((.children|length)==0 and .type!="disk")) then "unknown"
       else "ssd" end;
     def mount_class($disk):
       if (.fstype=="tmpfs" or .fstype=="ramfs") then {class:"memory",reason:"memory filesystem"}
       elif (.fstype|test("^(ext[234]|xfs|btrfs|f2fs|vfat|exfat|ntfs3?)$")|not)
         then {class:"unknown",reason:"filesystem type excluded from discovery"}
+      elif $disk=="loop" or ((.["maj:min"] // "")|startswith("7:")) or
+           ((.source // "")|test("^/dev/loop[0-9]+(p[0-9]+)?($|\\[)"))
+        then {class:"unknown",reason:"loop-backed mount"}
       elif $disk=="hdd" then {class:"hdd",reason:"device stack reports rotational media"}
+      elif $disk=="virtual-hdd" then {class:"hdd",ask:true,reason:"virtual disk reports rotation; host media unknown"}
       elif $disk=="ssd" then {class:"ssd",reason:"device stack reports non-rotational disks"}
-      elif $disk=="unknown" then {class:"unknown",reason:"loop device or incomplete backing disk or rotation information"}
-      else {class:"unknown",reason:"mount device ID absent from the block device tree"} end;
+      elif $disk=="unknown" then {class:"unknown",ask:true,reason:"incomplete backing disk or rotation information"}
+      else {class:"unknown",ask:true,reason:"mount device ID absent from the block device tree"} end;
     [$devices[0].blockdevices[]? | backing | {device:.["maj:min"],class:disk_class}]
     | group_by(.device) | map({key:.[0].device,value:
-        (if any(.[];.class=="hdd") then "hdd"
+        (if any(.[];.class=="loop") then "loop"
+         elif any(.[];.class=="hdd") then "hdd"
+         elif any(.[];.class=="virtual-hdd") then "virtual-hdd"
          elif any(.[];.class=="unknown") then "unknown" else "ssd" end)}) | from_entries as $disks
     | [$mounts[0].filesystems[] | (.["maj:min"] // "") as $id |
         {path:.target, filesystem:.fstype, device:$id} + mount_class($disks[$id])]
     | sort_by(.path|length) | reverse' >"$WORK/storage.json" || die 'Invalid storage inventory'
-  MOUNT_PATHS=() MOUNT_CLASSES=()
-  while IFS= read -r -d '' path && IFS= read -r -d '' class; do
+  MOUNT_PATHS=() MOUNT_CLASSES=() MOUNT_QUESTIONS=() MOUNT_APPROVED=()
+  while IFS= read -r -d '' path && IFS= read -r -d '' class && IFS= read -r -d '' question; do
     MOUNT_PATHS+=("$path")
     MOUNT_CLASSES+=("$class")
-  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000"' "$WORK/storage.json")
+    MOUNT_QUESTIONS+=("$question")
+  done < <(jq -j '.[]|.path,"\u0000",.class,"\u0000",
+    (if .ask then "\(.filesystem), device \(.device), class \(.class): \(.reason)" else "" end),"\u0000"' "$WORK/storage.json")
   STORAGE_READY=1
   cp -- "$WORK/storage.json" "$LOG_DIR/storage.json"
 }
 storage_class() {
   local path=$1 i
-  STORAGE_CLASS=unknown
+  STORAGE_CLASS=unknown STORAGE_APPROVED=0
   for i in "${!MOUNT_PATHS[@]}"; do
     if within "$path" "${MOUNT_PATHS[$i]}"; then
       STORAGE_CLASS=${MOUNT_CLASSES[$i]}
+      STORAGE_APPROVED=${MOUNT_APPROVED[$i]:-0}
       break
     fi
   done
@@ -201,7 +223,7 @@ storage_allowed() {
   local path=$1
   ((STORAGE_READY)) || return 0
   storage_class "$path"
-  [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory ]]
+  [[ $STORAGE_CLASS == ssd || $STORAGE_CLASS == memory || $STORAGE_APPROVED == 1 ]]
 }
 storage_warning() {
   local path=$1
@@ -211,21 +233,55 @@ storage_warning() {
   warning "$path" "Storage excluded: $STORAGE_CLASS"
   event storage_skipped "$path" "$STORAGE_CLASS"
 }
+ask_scan_mount() {
+  local i=$1 path=${MOUNT_PATHS[$1]} answer choice
+  printf '\n%s (%s)\n' "$path" "${MOUNT_QUESTIONS[$i]}" >&2
+  while true; do
+    printf 'Scan %s for Python environments? [y/N] ' "$path" >&2
+    if ! IFS= read -r answer; then
+      printf '\n' >&2
+      choice=input_ended
+      break
+    fi
+    case "${answer,,}" in
+      y | yes) choice=approved; break ;;
+      '' | n | no) choice=skipped; break ;;
+      *) printf 'Enter y to scan or n to skip.\n' >&2 ;;
+    esac
+  done
+  json_edit "$LOG_DIR/storage.json" --arg path "$path" --arg choice "$choice" \
+    'map(if .path==$path then .scan_choice=$choice else . end)'
+  event storage_choice "$path" "$choice"
+  case "$choice" in
+    approved) MOUNT_APPROVED[$i]=1 ;;
+    input_ended) die "Storage selection ended before discovery. Storage inventory: $LOG_DIR/storage.json" ;;
+  esac
+}
 automatic_roots() {
-  local path i
+  local path i asked=0
   ROOTS=()
   for i in "${!MOUNT_PATHS[@]}"; do
     path=${MOUNT_PATHS[$i]}
     case "$path/" in /proc/* | /sys/* | /dev/* | /run/*) continue ;; esac
     protected "$path" && continue
     if within "$path" "$RUNTIME_DIR" || within "$path" "$LOG_ROOT"; then continue; fi
-    case "${MOUNT_CLASSES[$i]}" in
-      ssd | memory)
-        if [[ -d $path ]]; then ROOTS+=("$path"); fi
-        ;;
-    esac
+    if [[ -n ${MOUNT_QUESTIONS[$i]} ]]; then
+      [[ -d $path ]] || continue
+      if ((asked == 0)); then
+        printf '\nSelect trusted mounts for discovery. Scanning runs candidate Python interpreters. Updates require a separate confirmation.\n' >&2
+      fi
+      asked=1
+      ask_scan_mount "$i"
+      if [[ ${MOUNT_APPROVED[$i]:-0} == 1 ]]; then ROOTS+=("$path"); fi
+    elif [[ ${MOUNT_CLASSES[$i]} == ssd || ${MOUNT_CLASSES[$i]} == memory ]]; then
+      if [[ -d $path ]]; then ROOTS+=("$path"); fi
+    fi
   done
   if ((${#ROOTS[@]} == 0)); then
+    if ((asked)); then
+      event no_scan '' 'All offered mounts were skipped'
+      return 0
+    fi
     # storage.json is ordered by descending mount path length. Use the same
     # path boundary as storage_class, including when HOME is on the root mount.
     jq -r --arg home "$(realpath -m -- "$HOME")" '
@@ -261,7 +317,7 @@ runpy() {
   local name
   local -a environment=(env -u VIRTUAL_ENV -u CONDA_PREFIX)
   for name in ${!PYTHON@}; do environment+=(-u "$name"); done
-  timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@"
+  timeout --kill-after=5 "${PY_TIMEOUT:-120}" "${environment[@]}" PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1 "$@" </dev/null
 }
 config_value() {
   awk -v key="$2" '$1==key && $2=="=" {sub(/^[^=]*= \"/, "");sub(/\"$/, "");print;exit}' "$1"
@@ -393,7 +449,7 @@ scan() {
       jq -cn --arg path "$root" --arg target "$resolved" '{path:$path,target:$target}' >>"$WORK/links.ndjson"
     fi
   done
-  # A selected SSD root can contain other SSD mountpoints. Add those roots
+  # A selected root can contain other eligible mountpoints. Add those roots
   # explicitly; each individual walk still stops at every mount boundary.
   for root in "${SCAN_ROOTS[@]}"; do
     for mount in "$root" "${MOUNT_PATHS[@]}"; do
@@ -572,6 +628,7 @@ healthy_target() {
 }
 load_cached_targets() {
   local mm path info
+  if ((INTERACTIVE)) && ! storage_allowed "$(realpath -m -- "$RUNTIME_DIR/targets.json")"; then return 0; fi
   [[ -f $RUNTIME_DIR/targets.json ]] || return 0
   jq -e 'type=="object" and all(.[];type=="string")' "$RUNTIME_DIR/targets.json" >/dev/null || die 'Invalid runtime cache targets.json'
   for mm in "${!POLICY[@]}"; do
@@ -750,6 +807,9 @@ confirm_interactive() {
   if ((count == 0)); then
     event no_updates '' 'Review plan.json and inventory.json for exclusions and skip reasons'
     return 1
+  fi
+  if jq -e 'any(.plan[];.action=="prepare_target")' "$plan" >/dev/null && ! storage_allowed "$RUNTIME_DIR"; then
+    die "A target build needs an eligible cache mount for $RUNTIME_DIR. Run again with XDG_DATA_HOME on a mount included for discovery."
   fi
   require_original_bases "$plan"
   jq '[.plan[]|select(.action=="update" or .action=="prepare_target")|
@@ -1440,6 +1500,7 @@ main() {
       load_storage
       if ((INTERACTIVE)); then
         automatic_roots
+        ((${#ROOTS[@]})) || return 0
       else
         ((${#ROOTS[@]})) || ROOTS=("$(canonical "$HOME")")
       fi
