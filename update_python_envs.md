@@ -232,7 +232,7 @@ discovered candidates, the newest patch is preferred. ABI and ownership checks
 also apply before an environment can update.
 
 If a required target is missing, `apply` calls `install_python.sh` with
-`--reuse --skip-conda --no-bashrc --py "<needed branches>"`. Only branches with
+`--reuse --skip-conda --no-bashrc --py <minor>` for each needed build. Only branches with
 eligible environments needing an update are built, including pinned legacy
 branches when present. An already current environment needs no build. Unknown
 branches are reported as skips. Existing package versions and minor branches
@@ -250,6 +250,31 @@ preparation in explicit `apply` commands happens before venv confirmations and r
 declining an update can leave a prepared target for future use. A build failure
 aborts before modifying existing environments. A cache lock prevents concurrent
 builds in the same runtime directory.
+
+### Free space for source builds
+
+Before compiling a target, the updater prints the runtime directory and its
+available bytes and inodes. The build budget is 1 GiB and 16,000 free inodes
+per active build. The inode check applies to filesystems with a reported inode
+limit. The budget is an estimate. Compiler options, quotas and concurrent writes
+can change the space available during the build. For a build with a known smaller
+footprint, `PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1` accepts a positive amount below
+the estimate. A filesystem reporting zero available bytes or zero usable inodes
+under a fixed inode limit stops the build.
+
+Targets build one at a time. Each build uses its own `src` for sources, objects
+and compiler temporary files. A successful build releases that directory and
+records the validated interpreter in `targets.json` before starting the next
+target. If a later build fails, a retry can reuse earlier targets. On a handled
+failure the updater removes the unfinished build it created. If permissions prevent
+cleanup, the process log names the remaining directory. Live environment updates
+start after target preparation succeeds.
+
+For a prior run that stopped during compilation, the exact ended run's
+`build-…/src` contains disposable build files. Keep the sibling `opt` directory,
+the runtime cache index and recovery backups. To use a roomier approved mount
+for new builds in the zero-argument workflow, set `XDG_DATA_HOME` to a directory
+on that mount. Live environments use their own filesystems for staging and backup.
 
 Scan and preview with the same defaults:
 

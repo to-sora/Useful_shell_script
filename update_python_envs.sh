@@ -7,6 +7,7 @@ export LC_ALL=C
 SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
 MARKER='.pyenv-update-'
 WORK=''
+PENDING_BUILD=''
 declare -a ROOTS=() EXCLUDES=() SCAN_ROOTS=() SCAN_EXCLUDES=() TARGET_SPECS=() LOCK_FDS=()
 declare -a PRUNE_PATHS=() TRUSTED_TARGETS=()
 declare -a INVOCATION=("$@")
@@ -32,6 +33,9 @@ now() { date -u +%FT%TZ; }
 cleanup() {
   local status=$? pid
   trap - EXIT
+  if [[ -n $PENDING_BUILD ]]; then
+    rm -rf --one-file-system -- "$PENDING_BUILD" || printf 'Could not remove unfinished target build: %s\n' "$PENDING_BUILD" >&2
+  fi
   if ((LOGGING)); then
     printf '[%s] Finished %s (exit %s)\n' "$(now)" "$COMMAND" "$status" >&2
     # Close both writers before waiting, so the log is complete on return.
@@ -689,8 +693,30 @@ discover_targets() {
   done < <(jq -r '.environments|map(select(.kind=="raw" and .managed=="private" and (.versions|length)==1))|
     sort_by(.version|split(".")|map(tonumber))|reverse|.[].binary' "$inventory")
 }
+check_build_space() {
+  local version=$1 report available total_inodes free_inodes
+  # One source tree, its objects and its installed runtime coexist until validation.
+  local min_bytes=$((1024 * 1024 * 1024)) min_inodes=16000 inode_short=0
+  report=$(df -B1 --output=avail,itotal,iavail -- "$RUNTIME_DIR") || die "Cannot measure build space at $RUNTIME_DIR"
+  read -r available total_inodes free_inodes <<< "${report##*$'\n'}"
+  [[ $available =~ ^-?[0-9]+$ ]] || die "Cannot read available bytes at $RUNTIME_DIR"
+  # Some filesystems allocate inodes dynamically and report zero or '-' for their total.
+  if [[ $total_inodes =~ ^[1-9][0-9]*$ && $free_inodes =~ ^-?[0-9]+$ ]]; then
+    ((free_inodes >= min_inodes)) || inode_short=1
+  else
+    free_inodes=unreported
+  fi
+  printf 'Python %s build at %s: %s bytes available, free inodes: %s. Build estimate: %s bytes (1 GiB) and %s inodes.\n' \
+    "$version" "$RUNTIME_DIR" "$available" "$free_inodes" "$min_bytes" "$min_inodes" >&2
+  if ((available >= min_bytes && inode_short == 0)); then return 0; fi
+  if [[ ${PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE:-} == 1 ]] && ((available > 0)) && { ((inode_short == 0)) || ((free_inodes > 0)); }; then
+    printf 'Proceeding below the estimate at operator request (PYTHON_UPDATER_ALLOW_LOW_BUILD_SPACE=1).\n' >&2
+    return 0
+  fi
+  die "Insufficient build space for Python $version at $RUNTIME_DIR. Free space there or set XDG_DATA_HOME to a directory on an approved mount (--runtime-dir for explicit apply). Existing environments were not updated."
+}
 prepare_targets() {
-  local plan=$1 mm build_dir path info fd shared
+  local plan=$1 mm build_dir path info fd shared skip_apt=$SKIP_APT
   local -a needed options=(--reuse --skip-conda --no-bashrc --jobs "$BUILD_JOBS") build_options
   jq -e 'any(.plan[];.action=="prepare_target")' "$plan" >/dev/null || return 0
   jq '[.plan[]|select(.action!="skip")]' "$plan" >"$WORK/control-prefixes.json"
@@ -701,29 +727,41 @@ prepare_targets() {
   flock -n "$fd" || die "Another updater is preparing targets in $RUNTIME_DIR"
   # Each build has a permanent, unique prefix. An interrupted or unhealthy
   # cached build is never rebuilt in place underneath an existing venv.
-  ((SKIP_APT == 0)) || options+=(--skip-apt)
   ((NO_SUDO == 0)) || options+=(--no-sudo)
   for shared in 0 1; do
     mapfile -t needed < <(jq -r --argjson shared "$shared" '[.plan[]|select(.action=="prepare_target" and .shared==$shared)|
       .version|split(".")[0:2]|join(".")]|unique[]' "$plan")
     ((${#needed[@]})) || continue
-    build_dir="$(mktemp -d "$RUNTIME_DIR/build-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
-    build_options=("${options[@]}")
-    ((shared == 0)) || build_options+=(--enable-shared)
-    event target_build_started "$build_dir" "${needed[*]} (shared=$shared)"
-    bash "${SELF%/*}/install_python.sh" "$build_dir" "${build_options[@]}" --py "${needed[*]}" </dev/null || die 'Target preparation failed; existing environments were not updated'
     for mm in "${needed[@]}"; do
+      check_build_space "${POLICY[$mm]}"
+      build_dir="$(mktemp -d "$RUNTIME_DIR/build-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+      PENDING_BUILD=$build_dir
+      mkdir -- "$build_dir/src"
+      build_options=("${options[@]}")
+      ((shared == 0)) || build_options+=(--enable-shared)
+      ((skip_apt == 0)) || build_options+=(--skip-apt)
+      event target_build_started "$build_dir" "$mm (shared=$shared)"
+      if ! TMPDIR="$build_dir/src" bash "${SELF%/*}/install_python.sh" "$build_dir" "${build_options[@]}" --py "$mm" </dev/null; then
+        df -B1 --output=target,avail,iavail -- "$build_dir" >&2 || true
+        die "Target preparation failed; existing environments were not updated (Python ${POLICY[$mm]}, build directory $build_dir)"
+      fi
+      skip_apt=1
       path="$build_dir/opt/python-${POLICY[$mm]}/bin/python$mm"
       info="$(target_info "$mm" "$path")" && [[ $(jq -r .shared <<<"$info") == "$shared" ]] && healthy_target "$path" || die "Prepared target failed validation: $path"
       remember_target "$mm" "$info" installed
+      rm -rf --one-file-system -- "$build_dir/src" || printf 'Could not remove build intermediates: %s/src\n' "$build_dir" >&2
+      # Once a cache write can refer to this runtime, cleanup must preserve it,
+      # including on interruption between atomic rename and filesystem sync.
+      PENDING_BUILD=''
+      if [[ ! -f $RUNTIME_DIR/targets.json ]]; then printf '{}\n' | atomic_write "$RUNTIME_DIR/targets.json"; fi
+      json_edit "$RUNTIME_DIR/targets.json" --arg mm "$mm" --arg path "$path" --arg shared "$shared" \
+        --slurpfile selected "$WORK/targets.json" '
+        reduce ($selected[0][$mm][]|select(.source=="cache")) as $t (.;
+          .[$mm+":shared="+($t.shared|tostring)]=$t.binary)
+        | .[$mm]=$path | .[$mm+":shared="+$shared]=$path'
+      event target_build_finished "$build_dir" "$mm (shared=$shared)"
     done
-    event target_build_finished "$build_dir" "${needed[*]} (shared=$shared)"
   done
-  [[ -f $RUNTIME_DIR/targets.json ]] || printf '{}\n' | atomic_write "$RUNTIME_DIR/targets.json"
-  json_edit "$RUNTIME_DIR/targets.json" --slurpfile targets "$WORK/targets.json" '
-    reduce ($targets[0][][]|select(.source=="installed" or .source=="cache")) as $t (.;
-      ($t.minor+":shared="+($t.shared|tostring)) as $key |
-      if $t.source=="installed" then .[$t.minor]=$t.binary | .[$key]=$t.binary else .[$key] //= $t.binary end)'
   exec {fd}>&-
 }
 protected() {
